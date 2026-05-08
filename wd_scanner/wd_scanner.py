@@ -72,7 +72,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.6.1"
+    __version__ = "2.6.2"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -166,6 +166,10 @@ class WdScanner(plugins.Plugin):
         self._c2_host = None                 # "user@host:port"
         self._c2_upload_running = False
         self._c2_upload_log = []
+
+        # Debug mode.
+        self._debug_enabled = False
+        self._debug_log = []
 
         # Auto-updater state.
         self._update_url = _DEFAULT_UPDATE_URL
@@ -362,6 +366,26 @@ class WdScanner(plugins.Plugin):
             return os.path.basename(target)
         except OSError:
             return None
+
+    # ------------------------------------------------------------------ debug
+
+    def _log_debug(self, msg, level="INFO"):
+        """Log debug message when debug mode enabled."""
+        if not self._debug_enabled:
+            return
+        ts = time.strftime("%H:%M:%S")
+        line = "[%s] [%s] %s" % (ts, level, msg)
+        self._debug_log.append(line)
+        if len(self._debug_log) > 500:
+            self._debug_log = self._debug_log[-500:]
+
+    def _capture_exception(self, context):
+        """Capture exception details to debug log."""
+        if not self._debug_enabled:
+            return
+        import traceback
+        tb = traceback.format_exc()
+        self._log_debug("EXCEPTION in %s:\n%s" % (context, tb), "ERROR")
 
     # ------------------------------------------------------- notes persistence
 
@@ -1347,10 +1371,24 @@ class WdScanner(plugins.Plugin):
         """Body of the recon job. Runs in its own thread."""
         agent = self._agent
         self._log_recon(">>> RECON STARTED — target SSID=%s BSSID=%s" % (ssid, bssid))
+        self._log_debug("recon_worker started: ssid=%s, bssid=%s" % (ssid, bssid))
+
         self._log_recon("selecting interface for recon...")
-        iface, was_shared, is_scan_iface = self._pick_recon_iface()
+        self._log_debug("calling _pick_recon_iface()")
+        try:
+            iface, was_shared, is_scan_iface = self._pick_recon_iface()
+            self._log_debug("_pick_recon_iface returned: iface=%s, was_shared=%s, is_scan_iface=%s" %
+                          (iface, was_shared, is_scan_iface))
+        except Exception as e:
+            self._capture_exception("_pick_recon_iface")
+            self._log_recon("ABORT: exception in interface selection: %s" % e)
+            self._recon_running = False
+            return
+
         if not iface:
             self._log_recon("ABORT: no usable interface for recon")
+            self._log_debug("no interface available: _mon_iface=%s, _iface_cfg=%s" %
+                          (self._mon_iface, self._iface_cfg))
             self._recon_running = False
             return
 
@@ -1442,26 +1480,41 @@ class WdScanner(plugins.Plugin):
 
             # If our iface is currently a monitor vif, we need to get back to the parent.
             # If it's a "mon" interface created by airmon-ng, stop it to get parent back.
+            self._log_debug("checking if interface '%s' is monitor mode" % iface)
             parent_iface = iface
             if "mon" in iface.lower():
                 self._log_recon("step 2/7: detected monitor interface %s, stopping to get parent..." % iface)
-                stop_result = self._run(["airmon-ng", "stop", iface], check=False, timeout=10)
-                self._log_recon("  airmon-ng stop output: %s" % stop_result[:200] if stop_result else "")
+                self._log_debug("running: airmon-ng stop %s" % iface)
+                try:
+                    stop_result = self._run(["airmon-ng", "stop", iface], check=False, timeout=10)
+                    self._log_recon("  airmon-ng stop output: %s" % stop_result[:200] if stop_result else "")
+                    self._log_debug("airmon-ng stop complete")
+                except Exception as e:
+                    self._capture_exception("airmon-ng stop")
+                    self._log_recon("  ERROR in airmon-ng stop: %s" % e)
                 # Extract parent interface name (usually the original name without "mon").
                 # e.g., "wlan1mon" -> "wlan1"
                 parent_iface = iface.replace("mon", "")
                 self._log_recon("  parent interface: %s" % parent_iface)
+                self._log_debug("parent_iface=%s" % parent_iface)
                 iface = parent_iface
             else:
                 # Regular interface, just switch mode.
                 self._log_recon("step 2/7: switching %s from monitor → managed mode..." % iface)
-                self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
-                self._log_recon("  %s brought DOWN" % iface)
-                self._run(["iw", "dev", iface, "set", "type", "managed"],
-                          check=False, timeout=5)
-                self._log_recon("  %s set to MANAGED mode" % iface)
-                self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
-                self._log_recon("  %s brought UP in managed mode" % iface)
+                self._log_debug("running: ip link set %s down" % iface)
+                try:
+                    self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
+                    self._log_recon("  %s brought DOWN" % iface)
+                    self._log_debug("running: iw dev %s set type managed" % iface)
+                    self._run(["iw", "dev", iface, "set", "type", "managed"],
+                              check=False, timeout=5)
+                    self._log_recon("  %s set to MANAGED mode" % iface)
+                    self._log_debug("running: ip link set %s up" % iface)
+                    self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
+                    self._log_recon("  %s brought UP in managed mode" % iface)
+                except Exception as e:
+                    self._capture_exception("interface mode switch")
+                    self._log_recon("  ERROR in mode switch: %s" % e)
 
             # 2. Start wpa_supplicant in the background.
             self._log_recon("step 3/7: starting wpa_supplicant...")
@@ -2849,6 +2902,13 @@ class WdScanner(plugins.Plugin):
             self._auto_attack = not self._auto_attack
             return jsonify({"enabled": self._auto_attack})
 
+        if req.method == "POST" and norm == "toggle_debug":
+            self._debug_enabled = not self._debug_enabled
+            if self._debug_enabled:
+                self._debug_log = []  # Clear log when enabling
+                self._log_debug("DEBUG MODE ENABLED")
+            return jsonify({"enabled": self._debug_enabled})
+
         if req.method == "POST" and norm == "export":
             bssid = (req.form.get("bssid") or "").strip()
             if not bssid:
@@ -2889,6 +2949,8 @@ class WdScanner(plugins.Plugin):
                 "pmkid_enabled": self._pmkid_attack_mode,
                 "auto_attack_enabled": self._auto_attack,
                 "mac_random_enabled": self._mac_random_enabled,
+                "debug_enabled": self._debug_enabled,
+                "debug_log": self._debug_log[-100:] if self._debug_enabled else [],
                 "filters": {
                     "min_signal": self._filter_min_signal,
                     "min_clients": self._filter_min_clients,
@@ -4274,6 +4336,7 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
   <div class='controls-panel'>
     <button class='toggle-btn' id='toggle-pmkid' {pmkid_disabled}>PMKID: <span id='pmkid-state'>{pmkid_state}</span></button>
     <button class='toggle-btn' id='toggle-auto-attack'>AUTO: <span id='auto-attack-state'>{auto_attack_state}</span></button>
+    <button class='toggle-btn' id='toggle-debug'>DEBUG: <span id='debug-state'>{debug_state}</span></button>
     <button class='toggle-btn' id='show-filters'>FILTERS</button>
     <button class='toggle-btn' id='show-c2'>C2 UPLOAD</button>
   </div>
@@ -4562,8 +4625,20 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
       .then(function (data) {{
         if (!data) return;
 
-        var running = terminalMode === 'recon' ? data.recon_running : data.plunder_running;
-        var logs = terminalMode === 'recon' ? (data.recon_log || []) : (data.plunder_log || []);
+        var running, logs;
+        if (terminalMode === 'debug') {{
+          running = data.debug_enabled;
+          logs = data.debug_log || [];
+        }} else if (terminalMode === 'recon') {{
+          running = data.recon_running;
+          logs = data.recon_log || [];
+        }} else if (terminalMode === 'plunder') {{
+          running = data.plunder_running;
+          logs = data.plunder_log || [];
+        }} else {{
+          running = false;
+          logs = [];
+        }}
 
         // Append new log lines.
         if (logs.length > terminalLogOffset) {{
@@ -4675,6 +4750,26 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
       .then(function (data) {{
         if (data) {{
           document.getElementById('auto-attack-state').textContent = data.enabled ? 'ON' : 'OFF';
+        }}
+      }})
+      .catch(function () {{}});
+  }});
+
+  document.getElementById('toggle-debug').addEventListener('click', function () {{
+    fetch('/plugins/wd_scanner/toggle_debug', {{
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+      body: 'csrf_token=' + encodeURIComponent((document.querySelector("input[name=csrf_token]") || {{}}).value || '')
+    }})
+      .then(function (r) {{ return r.ok ? r.json() : null; }})
+      .then(function (data) {{
+        if (data) {{
+          document.getElementById('debug-state').textContent = data.enabled ? 'ON' : 'OFF';
+          if (data.enabled) {{
+            // Show debug terminal immediately.
+            showTerminal('debug');
+          }}
         }}
       }})
       .catch(function () {{}});
@@ -4824,6 +4919,7 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
             pmkid_disabled="" if self._pmkid_available else "disabled",
             pmkid_state="ON" if self._pmkid_attack_mode else "OFF",
             auto_attack_state="ON" if self._auto_attack else "OFF",
+            debug_state="ON" if self._debug_enabled else "OFF",
             c2_host=escape(self._c2_host or "not configured"),
         )
         return body

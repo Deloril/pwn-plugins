@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "1.3.5"
+    __version__ = "1.4.0"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -1694,6 +1694,21 @@ class WdScanner(plugins.Plugin):
             threading.Thread(target=_run, daemon=True).start()
             return redirect("/plugins/wd_scanner/")
 
+        if req.method == "POST" and norm == "restart_service":
+            def _restart():
+                import subprocess
+                try:
+                    subprocess.Popen(
+                        ["systemctl", "restart", "pwnagotchi"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+            # Short delay so the HTTP response can be sent before the
+            # service dies.
+            threading.Timer(1.5, _restart).start()
+            return redirect("/plugins/wd_scanner/")
+
         if norm == "status.json":
             return jsonify({
                 "scan_running": self._scan_running,
@@ -2117,6 +2132,8 @@ body::before {{
 .btn[disabled] {{ opacity: .4; cursor: not-allowed; }}
 .btn.alt {{ background: #2a1300; color: var(--orange); border-color: var(--orange); }}
 .btn.alt:hover {{ background: #3a1c00; }}
+.btn.danger {{ background: #1a0007; color: var(--red); border-color: var(--red); }}
+.btn.danger:hover {{ background: #2a000c; }}
 
 /* ---- iface picker ----
    Stacked layout: dropdown row, then a 50/50 grid for SELECT/RELEASE
@@ -2358,6 +2375,20 @@ body::before {{
 }}
 .section-h::before, .section-h::after {{
   content: ''; flex: 1; height: 1px; background: var(--grid);
+}}
+.section-h.collapsible {{
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+}}
+.section-h.collapsible:active {{ color: var(--cyan); }}
+.collapse-arrow {{
+  display: inline-block; transition: transform .2s ease;
+  font-size: 9px;
+}}
+.section-h.collapsed .collapse-arrow {{
+  transform: rotate(-90deg);
+}}
+.grid.collapsed {{
+  display: none;
 }}
 .log {{
   margin: 0;
@@ -2632,7 +2663,9 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
 
   <div id='wd-shotgun'>{shotgun_panel}</div>
 
-  <div class='section-h'>nodes detected</div>
+  <div class='section-h collapsible' id='wd-grid-toggle'>
+    <span class='collapse-arrow'>&#x25BC;</span> nodes detected
+  </div>
   <div class='grid' id='wd-grid'>
     {cards}
   </div>
@@ -2668,10 +2701,36 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
     }}
   }});
 
+  // ---- Collapsible network list ----
+  var GRID_KEY = 'wd_grid_collapsed';
+  var toggle = document.getElementById('wd-grid-toggle');
+  var grid = document.getElementById('wd-grid');
+
+  function applyCollapsed(collapsed) {{
+    if (collapsed) {{
+      toggle.classList.add('collapsed');
+      grid.classList.add('collapsed');
+    }} else {{
+      toggle.classList.remove('collapsed');
+      grid.classList.remove('collapsed');
+    }}
+  }}
+
+  // Restore saved state.
+  var saved = localStorage.getItem(GRID_KEY);
+  if (saved === '1') applyCollapsed(true);
+
+  toggle.addEventListener('click', function () {{
+    var nowCollapsed = !grid.classList.contains('collapsed');
+    applyCollapsed(nowCollapsed);
+    localStorage.setItem(GRID_KEY, nowCollapsed ? '1' : '0');
+  }});
+
   // ---- Partial reload: swap only dynamic panes every 5 s ----
   var PANES = ['wd-status', 'wd-shotgun', 'wd-grid', 'wd-log', 'wd-recon'];
 
   function partialRefresh() {{
+    var isCollapsed = grid.classList.contains('collapsed');
     fetch(window.location.href, {{ credentials: 'same-origin' }})
       .then(function (r) {{ return r.ok ? r.text() : null; }})
       .then(function (html) {{
@@ -2685,6 +2744,8 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
             local.innerHTML = fresh.innerHTML;
           }}
         }}
+        // Re-apply collapsed state after DOM swap.
+        applyCollapsed(isCollapsed);
       }})
       .catch(function () {{}});
   }}
@@ -2791,6 +2852,11 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
             "          onsubmit=\"return confirm('Install update from\\n{url_js}?');\">"
             "      {csrf}"
             "      <button type='submit' class='btn alt' {install_disabled}>&#9660; INSTALL</button>"
+            "    </form>"
+            "    <form method='POST' action='/plugins/wd_scanner/restart_service'"
+            "          onsubmit=\"return confirm('// RESTART PWNAGOTCHI\\nThe service will go down for a few seconds.\\nContinue?');\">"
+            "      {csrf}"
+            "      <button type='submit' class='btn danger'>&#x21bb; RESTART</button>"
             "    </form>"
             "  </div>"
             "</div>"

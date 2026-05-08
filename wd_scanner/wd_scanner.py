@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.3.0"
+    __version__ = "2.4.0"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -1026,6 +1026,7 @@ class WdScanner(plugins.Plugin):
         """
         Decide which physical interface we'll use for recon. We need a
         managed-mode capable iface. Strategy:
+          - Exclude any interface currently in use for scanning.
           - Prefer a dedicated radio (not the one bettercap is on).
           - Otherwise fall back to whatever phy backs pwnagotchi's main
             radio: take down the monitor vif, bring the parent up in
@@ -1036,10 +1037,20 @@ class WdScanner(plugins.Plugin):
         main_iface = pwnagotchi_config_main_iface()
         main_phy = self._iface_phy(main_iface) if main_iface else None
 
+        # Build exclusion list: don't use interfaces currently in use for scanning.
+        excluded = set()
+        if self._mon_iface:
+            excluded.add(self._mon_iface)
+        if self._iface_cfg:
+            excluded.add(self._iface_cfg)
+
         # Look for a dedicated radio first.
         for it in self._list_wireless_ifaces():
-            if not it.get("shared") and it.get("name") != main_iface:
-                return it["name"], False
+            iface_name = it.get("name")
+            if iface_name in excluded:
+                continue
+            if not it.get("shared") and iface_name != main_iface:
+                return iface_name, False
 
         # Fall back to the parent of pwnagotchi's monitor vif.
         # main_iface is usually `mon0`; we want the parent (`wlan0`).
@@ -1050,13 +1061,15 @@ class WdScanner(plugins.Plugin):
                         continue
                     if n == main_iface:
                         continue
+                    if n in excluded:
+                        continue
                     if self._iface_phy(n) == main_phy:
                         return n, True
             except OSError:
                 pass
 
-        # Last resort: use the main iface itself.
-        if main_iface:
+        # Last resort: use the main iface itself (only if not excluded).
+        if main_iface and main_iface not in excluded:
             return main_iface, True
         return None, None
 
@@ -2365,6 +2378,8 @@ class WdScanner(plugins.Plugin):
                 "action_log": self._action_log[-50:],
                 "recon_running": self._recon_running,
                 "recon_log": self._recon_log[-50:],
+                "plunder_running": self._plunder_running,
+                "plunder_log": self._plunder_log[-50:],
                 "iface": self._iface_cfg,
                 "mon_iface": self._mon_iface,
                 "available": self._list_wireless_ifaces(),
@@ -3434,6 +3449,83 @@ footer.tag {{
   to   {{ box-shadow: 0 0 24px rgba(43,255,136,.4); }}
 }}
 
+/* ---- terminal popup ---- */
+.terminal-overlay {{
+  display: none;
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(0,0,0,.85);
+  backdrop-filter: blur(4px);
+  align-items: center; justify-content: center;
+  padding: 16px;
+}}
+.terminal-overlay.visible {{ display: flex; }}
+.terminal-box {{
+  width: 100%; max-width: 800px; max-height: 90vh;
+  background: linear-gradient(180deg, #0a0e12, #070a0d);
+  border: 2px solid var(--cyan);
+  clip-path: polygon(12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%, 0 12px);
+  display: flex; flex-direction: column;
+  box-shadow: 0 0 40px rgba(0,229,255,.3), inset 0 0 40px rgba(0,229,255,.05);
+}}
+.terminal-header {{
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--cyan-d);
+  background: rgba(0,229,255,.05);
+}}
+.terminal-title {{
+  display: flex; align-items: center; gap: 8px;
+  color: var(--cyan);
+  font-weight: 700; font-size: 13px;
+  letter-spacing: .2em; text-transform: uppercase;
+}}
+.terminal-title::before {{
+  content: '▸';
+  font-size: 16px;
+  animation: terminal-blink 1s steps(2) infinite;
+}}
+@keyframes terminal-blink {{
+  0%, 49% {{ opacity: 1; }}
+  50%, 100% {{ opacity: .3; }}
+}}
+.terminal-close {{
+  appearance: none; -webkit-appearance: none;
+  background: transparent; border: 1px solid var(--red);
+  color: var(--red);
+  font: inherit; font-size: 11px; font-weight: 700;
+  letter-spacing: .15em;
+  padding: 6px 12px; cursor: pointer;
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+  transition: background .12s;
+}}
+.terminal-close:hover {{ background: rgba(255,45,85,.15); }}
+.terminal-close:active {{ background: rgba(255,45,85,.25); }}
+.terminal-output {{
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px;
+  font-family: ui-monospace, "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--green);
+  background: rgba(0,0,0,.4);
+}}
+.terminal-output::-webkit-scrollbar {{ width: 8px; }}
+.terminal-output::-webkit-scrollbar-track {{ background: rgba(0,0,0,.3); }}
+.terminal-output::-webkit-scrollbar-thumb {{
+  background: var(--cyan-d);
+  border-radius: 4px;
+}}
+.terminal-output::-webkit-scrollbar-thumb:hover {{ background: var(--cyan); }}
+.terminal-line {{
+  margin-bottom: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}}
+.terminal-line.warn {{ color: var(--warn); }}
+.terminal-line.error {{ color: var(--red); }}
+.terminal-line.info {{ color: var(--cyan); }}
+
 /* ---- larger phones / small tablets ---- */
 @media (min-width: 560px) {{
   body {{ font-size: 15px; }}
@@ -3564,6 +3656,16 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
 <div class='toast' id='wd-toast'>
   <span class='toast-msg' id='wd-toast-msg'></span>
   <button class='toast-dismiss' id='wd-toast-dismiss'>DISMISS</button>
+</div>
+
+<div class='terminal-overlay' id='terminal-overlay'>
+  <div class='terminal-box'>
+    <div class='terminal-header'>
+      <div class='terminal-title' id='terminal-title'>OPERATION IN PROGRESS</div>
+      <button class='terminal-close' id='terminal-close'>CLOSE</button>
+    </div>
+    <div class='terminal-output' id='terminal-output'></div>
+  </div>
 </div>
 
 <script>
@@ -3714,6 +3816,110 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
   }}
 
   setInterval(partialRefresh, 5000);
+
+  // ---- Terminal popup for recon/plunder ----
+  var terminalOverlay = document.getElementById('terminal-overlay');
+  var terminalTitle = document.getElementById('terminal-title');
+  var terminalOutput = document.getElementById('terminal-output');
+  var terminalClose = document.getElementById('terminal-close');
+  var terminalPollInterval = null;
+  var terminalLogOffset = 0;
+  var terminalMode = null;  // 'recon' or 'plunder'
+
+  function showTerminal(mode) {{
+    terminalMode = mode;
+    terminalLogOffset = 0;
+    terminalOutput.innerHTML = '';
+    terminalTitle.textContent = mode === 'recon' ? 'RECON IN PROGRESS' : 'PLUNDER IN PROGRESS';
+    terminalOverlay.classList.add('visible');
+
+    // Start polling for logs.
+    if (terminalPollInterval) clearInterval(terminalPollInterval);
+    pollTerminalLogs();
+    terminalPollInterval = setInterval(pollTerminalLogs, 1000);
+  }}
+
+  function hideTerminal() {{
+    terminalOverlay.classList.remove('visible');
+    if (terminalPollInterval) {{
+      clearInterval(terminalPollInterval);
+      terminalPollInterval = null;
+    }}
+    terminalMode = null;
+    terminalLogOffset = 0;
+  }}
+
+  function pollTerminalLogs() {{
+    fetch('/plugins/wd_scanner/status.json', {{ credentials: 'same-origin' }})
+      .then(function (r) {{ return r.ok ? r.json() : null; }})
+      .then(function (data) {{
+        if (!data) return;
+
+        var running = terminalMode === 'recon' ? data.recon_running : data.plunder_running;
+        var logs = terminalMode === 'recon' ? (data.recon_log || []) : (data.plunder_log || []);
+
+        // Append new log lines.
+        if (logs.length > terminalLogOffset) {{
+          var newLines = logs.slice(terminalLogOffset);
+          for (var i = 0; i < newLines.length; i++) {{
+            var line = document.createElement('div');
+            line.className = 'terminal-line';
+            var text = newLines[i];
+            // Colorize based on keywords.
+            if (text.match(/ERROR|ABORT|failed|missing/i)) {{
+              line.classList.add('error');
+            }} else if (text.match(/WARNING|WARN/i)) {{
+              line.classList.add('warn');
+            }} else if (text.match(/step \\d|>>>|OK|launched|completed|SUCCESS/i)) {{
+              line.classList.add('info');
+            }}
+            line.textContent = text;
+            terminalOutput.appendChild(line);
+          }}
+          terminalLogOffset = logs.length;
+          // Auto-scroll to bottom.
+          terminalOutput.scrollTop = terminalOutput.scrollHeight;
+        }}
+
+        // If operation finished, stop polling.
+        if (!running && terminalLogOffset > 0) {{
+          if (terminalPollInterval) {{
+            clearInterval(terminalPollInterval);
+            terminalPollInterval = null;
+          }}
+        }}
+      }})
+      .catch(function () {{}});
+  }}
+
+  terminalClose.addEventListener('click', hideTerminal);
+
+  // Auto-show terminal when recon/plunder starts.
+  var lastReconRunning = false;
+  var lastPlunderRunning = false;
+
+  function checkForOperations() {{
+    fetch('/plugins/wd_scanner/status.json', {{ credentials: 'same-origin' }})
+      .then(function (r) {{ return r.ok ? r.json() : null; }})
+      .then(function (data) {{
+        if (!data) return;
+
+        // Show terminal if recon just started.
+        if (data.recon_running && !lastReconRunning && !terminalOverlay.classList.contains('visible')) {{
+          showTerminal('recon');
+        }}
+        lastReconRunning = data.recon_running;
+
+        // Show terminal if plunder just started.
+        if (data.plunder_running && !lastPlunderRunning && !terminalOverlay.classList.contains('visible')) {{
+          showTerminal('plunder');
+        }}
+        lastPlunderRunning = data.plunder_running;
+      }})
+      .catch(function () {{}});
+  }}
+
+  setInterval(checkForOperations, 1000);
 }})();
 </script>
 </body></html>

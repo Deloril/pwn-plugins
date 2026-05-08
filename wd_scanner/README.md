@@ -224,13 +224,32 @@ with legitimate devices.
 
 Enable via config: `main.plugins.wd_scanner.mac_random_enabled = true`
 
-### 13. Live Terminal Popup
+### 13. C2 Upload with Ephemeral Keys
 
-Real-time terminal-style output for recon/plunder operations with Watch
+Upload captured data to a remote C2 server via SSH. SSH private key is
+provided per-session through the web UI and **never written to disk** —
+stored only in RAM (/dev/shm tmpfs) during transfer, then securely wiped.
+
+Configure C2 host in config.toml:
+```toml
+main.plugins.wd_scanner.c2_host = "user@host:port"
+```
+
+When uploading, paste your SSH private key in the web UI. The key is:
+- Stored in /dev/shm (RAM-only tmpfs)
+- Overwritten with random data after use
+- Never persisted to the pwnagotchi's filesystem
+
+Files are uploaded to `/tmp/wd_upload_<hostname>_<timestamp>/` on the C2
+server.
+
+### 14. Live Terminal Popup
+
+Real-time terminal-style output for recon/plunder/C2 operations with Watch
 Dogs theme. Auto-appears on operation start, live-updates every second,
 color-coded logs (errors/warnings/info), auto-scroll.
 
-### 14. Auto-update
+### 15. Auto-update
 
 `on_internet_available` checks GitHub for a newer copy of the plugin
 (default once a day). New bytes are validated (parse, identity guard,
@@ -291,6 +310,9 @@ main.plugins.wd_scanner.auto_attack = false          # automatically attack all 
 # MAC randomization
 main.plugins.wd_scanner.mac_random_enabled = false   # randomize interface MAC
 main.plugins.wd_scanner.mac_random_oui = "Apple"     # or "Samsung", "Intel", etc. (optional)
+
+# C2 upload
+main.plugins.wd_scanner.c2_host = "user@host:22"     # SSH C2 server (key provided via UI)
 
 # Auto-update
 main.plugins.wd_scanner.update_url = "https://raw.githubusercontent.com/Deloril/pwn-plugins/main/wd_scanner/wd_scanner.py"

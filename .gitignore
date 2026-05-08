@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.bak
+*.new
+wd_scanner/screenshots/*.html

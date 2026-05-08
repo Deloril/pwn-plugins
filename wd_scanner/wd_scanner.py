@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "1.3.4"
+    __version__ = "1.3.5"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -3165,9 +3165,28 @@ footer.tag {{ margin: 16px 0 8px; text-align: center; color: var(--mute);
                 "<a href='/plugins/wd_scanner/recon' class='active'>RECON "
                 "<span class='count cyan'>{n}</span></a>"
                 "</nav>"
-                "<div class='section-h'>recon reports</div>"
+                "<div id='wd-recon-live'>"
                 "{running}"
+                "<div class='section-h'>recon reports</div>"
                 "{list_html}"
+                "</div>"
+                "<script>"
+                "(function(){{"
+                "  var el = document.getElementById('wd-recon-live');"
+                "  function poll(){{"
+                "    fetch(window.location.href, {{credentials:'same-origin'}})"
+                "      .then(function(r){{ return r.ok ? r.text() : null; }})"
+                "      .then(function(html){{"
+                "        if(!html) return;"
+                "        var doc = new DOMParser().parseFromString(html,'text/html');"
+                "        var fresh = doc.getElementById('wd-recon-live');"
+                "        if(fresh && el) el.innerHTML = fresh.innerHTML;"
+                "      }})"
+                "      .catch(function(){{}});"
+                "  }}"
+                "  setInterval(poll, 4000);"
+                "}})();"
+                "</script>"
             ).format(n=len(reports), running=running_panel, list_html=list_html),
             mark_color="cyan",
         )

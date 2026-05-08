@@ -72,7 +72,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.6.2"
+    __version__ = "2.6.3"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -1539,13 +1539,13 @@ class WdScanner(plugins.Plugin):
 
             # 3. dhclient.
             self._log_recon("step 4/7: requesting DHCP lease on %s (timeout %ds)..." % (iface, self._recon_dwell))
-            self._log_recon("  cmd: dhclient -1 -timeout %d %s" % (self._recon_dwell, iface))
+            self._log_recon("  cmd: dhclient -1 --timeout %d %s" % (self._recon_dwell, iface))
             dhcp_result = self._run([
                 "dhclient",
                 "-pf", dhcp_pid,
                 "-lf", dhcp_lease,
                 "-1",
-                "-timeout", str(self._recon_dwell),
+                "--timeout", str(self._recon_dwell),
                 iface,
             ], check=False, timeout=self._recon_dwell + 5)
             if dhcp_result:
@@ -2776,6 +2776,18 @@ class WdScanner(plugins.Plugin):
                 return redirect("/plugins/wd_scanner/")
             self._start_recon(ssid, bssid, password)
             return redirect("/plugins/wd_scanner/")
+
+        if req.method == "POST" and norm == "recon/delete":
+            # Delete a recon report.
+            report_name = (req.form.get("report") or "").strip()
+            if report_name and report_name.endswith(".json"):
+                report_path = os.path.join(self._recon_dir(), report_name)
+                try:
+                    if os.path.exists(report_path):
+                        os.remove(report_path)
+                except Exception:
+                    pass
+            return redirect("/plugins/wd_scanner/recon")
 
         if norm == "recon" or norm == "recon/":
             return self._render_recon_list()
@@ -4350,7 +4362,9 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
     {cards}
   </div>
 
-  <div class='section-h'>action log</div>
+  <div class='section-h collapsible' id='wd-log-toggle'>
+    <span class='collapse-arrow'>&#x25BC;</span> action log
+  </div>
   <pre class='log' id='wd-log'>{log}</pre>
 
   <div id='wd-recon'>{recon_panel}</div>
@@ -4483,6 +4497,31 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
     var nowCollapsed = !grid.classList.contains('collapsed');
     applyCollapsed(nowCollapsed);
     localStorage.setItem(GRID_KEY, nowCollapsed ? '1' : '0');
+  }});
+
+  // ---- Collapsible action log ----
+  var LOG_KEY = 'wd_log_collapsed';
+  var logToggle = document.getElementById('wd-log-toggle');
+  var logPane = document.getElementById('wd-log');
+
+  function applyLogCollapsed(collapsed) {{
+    if (collapsed) {{
+      logToggle.classList.add('collapsed');
+      logPane.classList.add('collapsed');
+    }} else {{
+      logToggle.classList.remove('collapsed');
+      logPane.classList.remove('collapsed');
+    }}
+  }}
+
+  // Restore saved state.
+  var savedLog = localStorage.getItem(LOG_KEY);
+  if (savedLog === '1') applyLogCollapsed(true);
+
+  logToggle.addEventListener('click', function () {{
+    var nowCollapsed = !logPane.classList.contains('collapsed');
+    applyLogCollapsed(nowCollapsed);
+    localStorage.setItem(LOG_KEY, nowCollapsed ? '1' : '0');
   }});
 
   // ---- Per-SSID collapse ----
@@ -5312,6 +5351,7 @@ footer.tag {{ margin: 16px 0 8px; text-align: center; color: var(--mute);
     def _render_recon_list(self):
         reports = self._list_recon_reports()
         running = self._recon_running
+        csrf_input = self._csrf_input()
         rows = []
         for r in reports:
             rep = self._load_recon_report(r["name"]) or {}
@@ -5323,6 +5363,7 @@ footer.tag {{ margin: 16px 0 8px; text-align: center; color: var(--mute);
             with_ports = len(rep.get("ports") or {})
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["mtime"]))
             rows.append(
+                "<div class='recon-row-wrap'>"
                 "<a class='recon-row' href='/plugins/wd_scanner/recon/{name}'>"
                 "  <header class='recon-row-h'>"
                 "    <span class='recon-row-ssid'>{ssid}</span>"
@@ -5335,9 +5376,16 @@ footer.tag {{ margin: 16px 0 8px; text-align: center; color: var(--mute);
                 "    <div><dt>ALIVE</dt><dd>{alive}</dd></div>"
                 "    <div><dt>W/ PORTS</dt><dd>{wp}</dd></div>"
                 "  </dl>"
-                "</a>".format(
+                "</a>"
+                "<form method='post' action='/plugins/wd_scanner/recon/delete' style='display:inline;' "
+                "onsubmit='return confirm(\"Delete this recon report?\");'>"
+                "{csrf}"
+                "<input type='hidden' name='report' value='{name}'>"
+                "<button type='submit' class='recon-delete-btn' title='Delete report'>&#x2715;</button>"
+                "</form>"
+                "</div>".format(
                     name=escape(r["name"]), ssid=ssid, bssid=bssid, ip=ip,
-                    subnet=subnet, alive=alive, wp=with_ports, ts=ts,
+                    subnet=subnet, alive=alive, wp=with_ports, ts=ts, csrf=csrf_input,
                 )
             )
         list_html = "\n".join(rows) if rows else (
@@ -5786,10 +5834,13 @@ body::before {{
   content: ''; flex: 1; height: 1px; background: var(--grid);
 }}
 
+.recon-row-wrap {{
+  position: relative; margin-bottom: 8px;
+}}
 .recon-row {{
   display: block; text-decoration: none; color: var(--fg);
   background: linear-gradient(180deg, #0d1318, #0a0d11);
-  border: 1px solid var(--grid); padding: 10px 12px; margin-bottom: 8px;
+  border: 1px solid var(--grid); padding: 10px 12px;
   position: relative;
   clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
 }}
@@ -5798,6 +5849,18 @@ body::before {{
   content: ''; position: absolute; left: 0; top: 0; bottom: 0;
   width: 3px; background: var(--cyan); box-shadow: 0 0 10px rgba(0,229,255,.4);
 }}
+.recon-delete-btn {{
+  position: absolute; top: 10px; right: 10px;
+  width: 28px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  background: #1a0007; color: var(--red); border: 1px solid var(--red);
+  font-size: 14px; font-weight: 700; cursor: pointer;
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+  transition: background .12s, transform .08s;
+  z-index: 10;
+}}
+.recon-delete-btn:hover {{ background: #2a000c; transform: scale(1.05); }}
+.recon-delete-btn:active {{ transform: scale(0.95); }}
 .recon-row-h {{
   display: flex; align-items: baseline; justify-content: space-between;
   gap: 10px; margin-bottom: 6px;

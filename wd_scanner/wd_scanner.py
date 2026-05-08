@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "1.3.2"
+    __version__ = "1.3.3"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -2119,23 +2119,25 @@ body::before {{
 .btn.alt {{ background: #2a1300; color: var(--orange); border-color: var(--orange); }}
 .btn.alt:hover {{ background: #3a1c00; }}
 
-/* ---- iface picker ---- */
+/* ---- iface picker ----
+   Stacked layout: dropdown row, then a 50/50 grid for SELECT/RELEASE
+   so the buttons are equal-width and never get squashed off the edge.
+*/
 .picker {{
-  display: flex; gap: 8px; align-items: stretch;
-  flex-wrap: wrap;
   margin: 0 -12px 8px;
   padding: 10px;
   background: linear-gradient(180deg, #0a0e12, #07090b);
   border-bottom: 1px solid var(--grid);
+  display: flex; flex-direction: column; gap: 8px;
 }}
-.picker form {{
-  display: flex; gap: 8px; flex: 1 1 100%;
-  min-width: 0;
+.picker form {{ margin: 0; }}
+.picker .picker-select-row {{
+  display: flex;
 }}
-.picker form.release {{ flex: 0 0 auto; }}
 .picker select {{
   flex: 1 1 auto;
   min-width: 0;
+  width: 100%;
   appearance: none; -webkit-appearance: none;
   background: #05080a;
   color: var(--cyan);
@@ -2149,14 +2151,26 @@ body::before {{
   background-position: calc(100% - 18px) 50%, calc(100% - 12px) 50%;
   background-size: 6px 6px, 6px 6px;
   background-repeat: no-repeat;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
 }}
 .picker select:focus {{
   outline: none; border-color: var(--cyan);
   box-shadow: 0 0 0 2px rgba(0,229,255,.2);
 }}
-.picker .btn {{ flex: 0 0 auto; padding: 0 14px; }}
-@media (min-width: 520px) {{
-  .picker form {{ flex: 1 1 auto; }}
+.picker .picker-actions {{
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}}
+.picker .picker-actions form {{
+  display: flex;
+  margin: 0;
+}}
+.picker .picker-actions .btn {{
+  flex: 1 1 auto;
+  width: 100%;
+  height: 44px;
+  padding: 0 14px;
 }}
 .err {{
   margin: 0 0 10px;
@@ -2586,17 +2600,23 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
   </div>
 
   <div class='picker'>
-    <form method='POST' action='/plugins/wd_scanner/select'>
+    <form method='POST' action='/plugins/wd_scanner/select' id='picker-form'>
       {csrf}
-      <select name='interface' aria-label='auxiliary radio' {pick_disabled}>
-        {options}
-      </select>
-      <button type='submit' class='btn' {pick_disabled}>&#9711; SELECT</button>
+      <div class='picker-select-row'>
+        <select name='interface' aria-label='auxiliary radio' {pick_disabled}>
+          {options}
+        </select>
+      </div>
     </form>
-    <form method='POST' action='/plugins/wd_scanner/release' class='release'>
-      {csrf}
-      <button type='submit' class='btn alt' {release_disabled}>&#10005; RELEASE</button>
-    </form>
+    <div class='picker-actions'>
+      <button type='submit' form='picker-form' class='btn' {pick_disabled}>
+        &#9711; SELECT
+      </button>
+      <form method='POST' action='/plugins/wd_scanner/release'>
+        {csrf}
+        <button type='submit' class='btn alt' {release_disabled}>&#10005; RELEASE</button>
+      </form>
+    </div>
   </div>
   {select_err}
   {select_hint}

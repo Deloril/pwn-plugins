@@ -242,6 +242,7 @@ recon button becomes a no-op (everything else still works).
 | Recon: "no IPv4 acquired" | DHCP didn't reply within `recon_dhcp_dwell` seconds | Bump `recon_dhcp_dwell` to 15 |
 | Recon: "wpa_supplicant/dhclient missing" | One of the dependencies isn't installed | `apt-get install -y wpasupplicant isc-dhcp-client nmap` |
 | Recon report shows no ports | Hosts blocked top-100 / `nmap -F` skipped them | Increase `recon_seconds` for a deeper scan |
+| Phone tether / BT / network drops the moment I press SELECT | You're on a version older than 1.3.2 — old `airmon-ng check kill` killed NetworkManager + wpa_supplicant globally | Upgrade to 1.3.2+ which only unmanages the chosen iface, leaving NM, BT, and your tether alone |
 | Pwned vault is empty even though I have cracked networks | Crackers writing elsewhere | Verify `bettercap.handshakes` matches your cracker's output dir |
 
 ---

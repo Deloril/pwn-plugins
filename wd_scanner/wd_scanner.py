@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "1.3.1"
+    __version__ = "1.3.2"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -394,7 +394,14 @@ class WdScanner(plugins.Plugin):
     # ------------------------------------------------------------- monitor mode
 
     def _ensure_monitor_mode(self):
-        """Put the aux interface in monitor mode using airmon-ng."""
+        """Put the aux interface in monitor mode using airmon-ng.
+
+        IMPORTANT: never run `airmon-ng check kill`. That nukes
+        NetworkManager + wpa_supplicant globally, which breaks the
+        Bluetooth-tether path users rely on to reach the web UI in the
+        first place. Instead we unmanage just THIS iface and stop only
+        the wpa_supplicant instance attached to it.
+        """
         if not self._iface_cfg:
             return None
 
@@ -403,8 +410,8 @@ class WdScanner(plugins.Plugin):
             self._mon_iface = self._iface_cfg
             return self._mon_iface
 
-        # Kill known interferers (NetworkManager, wpa_supplicant).
-        self._run(["airmon-ng", "check", "kill"], check=False, timeout=10)
+        # Per-iface unmanage. Leave the rest of the system alone.
+        self._unmanage_iface(self._iface_cfg)
 
         out = self._run(
             ["airmon-ng", "start", self._iface_cfg], check=False, timeout=15
@@ -422,14 +429,66 @@ class WdScanner(plugins.Plugin):
                     break
 
         if not self._mon_iface:
-            logging.error("[wd_scanner] failed to enable monitor mode on %s", self._iface_cfg)
+            logging.error(
+                "[wd_scanner] failed to enable monitor mode on %s "
+                "(other connections were NOT touched)",
+                self._iface_cfg,
+            )
         return self._mon_iface
 
     def _restore_managed_mode(self):
         if not self._mon_iface:
             return
         self._run(["airmon-ng", "stop", self._mon_iface], check=False, timeout=15)
+        # Hand the iface back to NetworkManager (if it was managing it).
+        if self._iface_cfg:
+            self._remanage_iface(self._iface_cfg)
         self._mon_iface = None
+
+    # ------------------------------------ targeted (non-global) unmanage ----
+
+    def _unmanage_iface(self, iface):
+        """
+        Free `iface` from any userspace that might fight us, WITHOUT
+        touching other interfaces. Specifically:
+          * tell NetworkManager to ignore just this iface
+          * stop only the wpa_supplicant instance bound to this iface
+          * release any DHCP lease on this iface
+        Other interfaces (bnep0 over BT, eth0, the pwnagotchi tether, ...)
+        keep running.
+        """
+        if not iface:
+            return
+        # NetworkManager: per-iface unmanage. Best-effort; nmcli may not be
+        # installed on a stock pwnagotchi image and that's fine.
+        if shutil.which("nmcli"):
+            self._run(["nmcli", "device", "set", iface, "managed", "no"],
+                      check=False, timeout=5)
+
+        # wpa_supplicant: prefer the control socket so we kill the right one.
+        if shutil.which("wpa_cli"):
+            self._run(["wpa_cli", "-i", iface, "terminate"],
+                      check=False, timeout=5)
+        # Belt-and-braces: kill only processes whose argv contains "-i <iface>".
+        # We never use plain `pkill -x wpa_supplicant` here because that would
+        # take down ANY wpa_supplicant on the system, including the one
+        # NetworkManager is using for your tether/uplink.
+        self._run(
+            ["pkill", "-f", r"wpa_supplicant.*-i\s*%s(\s|$)" % re.escape(iface)],
+            check=False, timeout=5,
+        )
+
+        # dhclient lease release scoped to this iface only.
+        if shutil.which("dhclient"):
+            self._run(["dhclient", "-r", iface], check=False, timeout=5)
+
+    def _remanage_iface(self, iface):
+        """Reverse of _unmanage_iface."""
+        if not iface:
+            return
+        if shutil.which("nmcli"):
+            self._run(["nmcli", "device", "set", iface, "managed", "yes"],
+                      check=False, timeout=5)
 
     def _is_monitor(self, iface):
         out = self._run(["iw", "dev", iface, "info"], check=False, timeout=5) or ""
@@ -1073,13 +1132,21 @@ class WdScanner(plugins.Plugin):
             logging.exception("[wd_scanner] recon failed")
             self._log_recon("recon failed: %s" % e)
         finally:
-            # 8. Tear everything down.
+            # 8. Tear everything down. Targeted only — NEVER kill all
+            # wpa_supplicants on the system, that takes down the BT
+            # tether/uplink that the user is using to reach this UI.
             self._run(["dhclient", "-r", "-pf", dhcp_pid, "-lf", dhcp_lease, iface],
                       check=False, timeout=10)
             if wpa_started:
+                # First try the pidfile we just wrote.
                 self._run(["pkill", "-F", wpa_pid], check=False, timeout=5)
-                # If pkill -F failed (different /proc layout) try plain pkill.
-                self._run(["pkill", "-x", "wpa_supplicant"], check=False, timeout=5)
+                # Fallback: only target processes whose argv mentions THIS
+                # iface, so we don't touch wpa_supplicant instances running
+                # on other interfaces.
+                self._run(
+                    ["pkill", "-f", r"wpa_supplicant.*-i\s*%s(\s|$)" % re.escape(iface)],
+                    check=False, timeout=5,
+                )
 
             # Restore the iface to monitor mode if it was bettercap's.
             if was_shared:

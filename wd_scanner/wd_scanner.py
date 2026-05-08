@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.1.0"
+    __version__ = "2.2.0"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -982,6 +982,11 @@ class WdScanner(plugins.Plugin):
         self._recon_log.append(line)
         if len(self._recon_log) > 400:
             self._recon_log = self._recon_log[-400:]
+        # Also surface recon activity in the main action log so the
+        # scanner page shows what's happening without navigating away.
+        self._action_log.append("[recon] %s" % msg)
+        if len(self._action_log) > 200:
+            self._action_log = self._action_log[-200:]
         logging.info("[wd_scanner.recon] %s", msg)
 
     def _start_recon(self, ssid, bssid, password):
@@ -1050,31 +1055,38 @@ class WdScanner(plugins.Plugin):
     def _recon_worker(self, ssid, bssid, password):
         """Body of the recon job. Runs in its own thread."""
         agent = self._agent
+        self._log_recon(">>> RECON STARTED — target SSID=%s BSSID=%s" % (ssid, bssid))
+        self._log_recon("selecting interface for recon...")
         iface, was_shared = self._pick_recon_iface()
         if not iface:
-            self._log_recon("no usable interface for recon")
+            self._log_recon("ABORT: no usable interface for recon")
             self._recon_running = False
             return
 
-        self._log_recon("recon target: %s (%s)" % (ssid, bssid))
-        self._log_recon("recon iface: %s%s" % (
-            iface, " (shared with pwnagotchi)" if was_shared else ""
+        self._log_recon("recon iface selected: %s%s" % (
+            iface, " [SHARED — pwnagotchi will pause]" if was_shared else " [DEDICATED]"
         ))
 
         # Tooling check.
+        self._log_recon("checking required tools...")
         if not shutil.which("wpa_supplicant") or not shutil.which("dhclient"):
-            self._log_recon("wpa_supplicant/dhclient missing — install wpasupplicant + isc-dhcp-client")
+            self._log_recon("ABORT: wpa_supplicant/dhclient missing — install wpasupplicant + isc-dhcp-client")
             self._recon_running = False
             return
         if not shutil.which("nmap"):
-            self._log_recon("nmap not on PATH; install with `apt-get install nmap`")
+            self._log_recon("WARNING: nmap not on PATH; install with `apt-get install nmap`")
+        self._log_recon("tools OK: wpa_supplicant=%s dhclient=%s nmap=%s" % (
+            shutil.which("wpa_supplicant"), shutil.which("dhclient"),
+            shutil.which("nmap") or "MISSING"
+        ))
 
         if not self._wpa_psk_safe(password):
-            self._log_recon("password contains illegal characters; aborting")
+            self._log_recon("ABORT: password contains illegal characters (quote/newline)")
             self._recon_running = False
             return
 
         # Build the config file.
+        self._log_recon("preparing wpa_supplicant config...")
         tmpdir = tempfile.mkdtemp(prefix="wd_recon_")
         wpa_conf = os.path.join(tmpdir, "wpa_supplicant.conf")
         wpa_pid = os.path.join(tmpdir, "wpa_supplicant.pid")
@@ -1099,8 +1111,9 @@ class WdScanner(plugins.Plugin):
                     "}\n"
                 )
             os.chmod(wpa_conf, 0o600)
+            self._log_recon("wpa config written to %s (mode 600)" % wpa_conf)
         except OSError as e:
-            self._log_recon("couldn't write wpa config: %s" % e)
+            self._log_recon("ABORT: couldn't write wpa config: %s" % e)
             self._recon_running = False
             return
 
@@ -1125,24 +1138,31 @@ class WdScanner(plugins.Plugin):
 
         try:
             # 1. Pause pwnagotchi/bettercap so the radio is free for managed.
+            self._log_recon("step 1/7: pausing bettercap wifi.recon...")
             try:
                 agent.run("wifi.recon off")
-                self._log_recon("paused bettercap recon")
+                self._log_recon("  bettercap recon PAUSED — radio released")
                 bettercap_paused_here = True
             except Exception as e:
-                self._log_recon("could not pause bettercap: %s" % e)
+                self._log_recon("  WARNING: could not pause bettercap: %s" % e)
 
             # If our iface is currently a monitor vif, take it down and put
             # it back to managed. Same for shared mode where the parent radio
             # might still be in monitor.
+            self._log_recon("step 2/7: switching %s from monitor → managed mode..." % iface)
             self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
+            self._log_recon("  %s brought DOWN" % iface)
             self._run(["iw", "dev", iface, "set", "type", "managed"],
                       check=False, timeout=5)
+            self._log_recon("  %s set to MANAGED mode" % iface)
             self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
+            self._log_recon("  %s brought UP in managed mode" % iface)
 
             # 2. Start wpa_supplicant in the background.
-            self._log_recon("associating with %s ..." % ssid)
-            self._run([
+            self._log_recon("step 3/7: starting wpa_supplicant...")
+            self._log_recon("  cmd: wpa_supplicant -B -D nl80211,wext -i %s -c %s" % (iface, wpa_conf))
+            self._log_recon("  connecting to SSID '%s' with known PSK..." % ssid)
+            wpa_result = self._run([
                 "wpa_supplicant",
                 "-B",
                 "-D", "nl80211,wext",
@@ -1151,10 +1171,18 @@ class WdScanner(plugins.Plugin):
                 "-P", wpa_pid,
             ], check=False, timeout=10)
             wpa_started = True
+            self._log_recon("  wpa_supplicant launched (pid file: %s)" % wpa_pid)
+            if wpa_result:
+                self._log_recon("  wpa output: %s" % wpa_result.strip()[:200])
+
+            # Brief pause to allow association to complete.
+            time.sleep(2)
+            self._log_recon("  waiting for WPA association to complete...")
 
             # 3. dhclient.
-            self._log_recon("requesting DHCP lease (dwell=%ds)..." % self._recon_dwell)
-            self._run([
+            self._log_recon("step 4/7: requesting DHCP lease on %s (timeout %ds)..." % (iface, self._recon_dwell))
+            self._log_recon("  cmd: dhclient -1 -timeout %d %s" % (self._recon_dwell, iface))
+            dhcp_result = self._run([
                 "dhclient",
                 "-pf", dhcp_pid,
                 "-lf", dhcp_lease,
@@ -1162,31 +1190,36 @@ class WdScanner(plugins.Plugin):
                 "-timeout", str(self._recon_dwell),
                 iface,
             ], check=False, timeout=self._recon_dwell + 5)
+            if dhcp_result:
+                self._log_recon("  dhclient output: %s" % dhcp_result.strip()[:200])
 
             ip = self._iface_ipv4(iface)
             gw = self._iface_default_gw()
             if not ip:
-                self._log_recon("no IPv4 acquired; aborting recon")
+                self._log_recon("ABORT: no IPv4 address acquired after %ds — AP may have rejected us or DHCP timed out" % self._recon_dwell)
+                self._log_recon("  (try increasing recon_dhcp_dwell in config.toml)")
                 return
             result["ip"], result["gateway"] = ip, gw
-            self._log_recon("ip=%s gw=%s" % (ip, gw or "?"))
+            self._log_recon("  CONNECTED! our IP: %s | gateway: %s" % (ip, gw or "unknown"))
 
             # 4. Compute subnet, capped to /24.
+            self._log_recon("step 5/7: deriving network subnet...")
             net_base, net_mask = self._derive_subnet(ip)
             result["subnet"] = "%s/%d" % (net_base, net_mask)
             host_count = (1 << (32 - net_mask)) - 2
+            self._log_recon("  subnet: %s/%d (%d possible hosts)" % (net_base, net_mask, host_count))
             if host_count > self._recon_subnet_max:
                 self._log_recon(
-                    "subnet /%d has %d hosts, capping to first %d"
-                    % (net_mask, host_count, self._recon_subnet_max)
+                    "  WARNING: subnet too large (%d hosts), capping scan to first %d"
+                    % (host_count, self._recon_subnet_max)
                 )
 
             # 5. Ping sweep (nmap -sn). Bound by recon_seconds.
             sweep_target = "%s/%d" % (net_base, net_mask)
             sweep_seconds = max(8, self._recon_seconds // 2)
-            self._log_recon(
-                "nmap ping sweep on %s (timeout %ds)" % (sweep_target, sweep_seconds)
-            )
+            self._log_recon("step 6/7: nmap ping sweep — discovering alive hosts...")
+            self._log_recon("  cmd: nmap -sn -n --max-retries 1 --host-timeout %ds -T4 %s" % (sweep_seconds, sweep_target))
+            self._log_recon("  scanning %d addresses (budget: %ds)..." % (host_count, sweep_seconds))
             sweep_out = self._run([
                 "nmap", "-sn", "-n",
                 "--max-retries", "1",
@@ -1200,49 +1233,75 @@ class WdScanner(plugins.Plugin):
                 alive.insert(0, gw)
             alive = alive[: self._recon_subnet_max]
             result["alive_hosts"] = alive
-            self._log_recon("alive hosts: %d" % len(alive))
+            self._log_recon("  ping sweep complete: %d hosts responded" % len(alive))
+            if alive:
+                self._log_recon("  alive: %s" % ", ".join(alive[:15]))
+                if len(alive) > 15:
+                    self._log_recon("  ... and %d more" % (len(alive) - 15))
 
             # 6. Top-100 fast port scan, capped by remaining budget.
-            remaining = max(8, self._recon_seconds - (time.time() - t0))
+            elapsed = time.time() - t0
+            remaining = max(8, self._recon_seconds - elapsed)
+            self._log_recon("step 7/7: port scanning alive hosts...")
+            self._log_recon("  elapsed so far: %.1fs | remaining budget: %.1fs" % (elapsed, remaining))
             if alive:
                 port_seconds = int(remaining)
-                self._log_recon(
-                    "nmap -F port scan on %d hosts (budget %ds)"
-                    % (len(alive), port_seconds)
-                )
+                per_host_timeout = max(5, port_seconds // max(1, len(alive)))
+                self._log_recon("  cmd: nmap -Pn -n -F --open -T4 (top-100 ports)")
+                self._log_recon("  scanning %d hosts, %ds per-host timeout, %ds total budget" % (
+                    len(alive), per_host_timeout, port_seconds
+                ))
                 ports_out = self._run([
                     "nmap", "-Pn", "-n", "-F",
                     "--max-retries", "1",
-                    "--host-timeout", str(max(5, port_seconds // max(1, len(alive)))) + "s",
+                    "--host-timeout", str(per_host_timeout) + "s",
                     "-T4",
                     "--open",
                 ] + alive,
                     check=False, timeout=port_seconds + 15) or ""
                 result["ports"] = self._parse_nmap_ports(ports_out)
+                # Log per-host port findings.
+                if result["ports"]:
+                    for h, ports in result["ports"].items():
+                        self._log_recon("  %s → open ports: %s" % (h, ", ".join(str(p) for p in ports)))
+                else:
+                    self._log_recon("  no open ports found on any host")
+            else:
+                self._log_recon("  no alive hosts to port-scan — skipping")
 
             # 7. Reverse DNS via gateway.
+            self._log_recon("resolving reverse DNS for %d hosts..." % len(alive))
+            dns_count = 0
             for host in alive:
                 try:
                     name = socket.gethostbyaddr(host)[0]
                     if name and name != host:
                         result["names"][host] = name
+                        dns_count += 1
+                        self._log_recon("  %s → %s" % (host, name))
                 except (socket.herror, socket.gaierror, OSError):
                     pass
+            if dns_count == 0:
+                self._log_recon("  no reverse DNS names resolved")
 
             self._log_recon(
-                "recon done: %d alive, %d with open ports, %d named"
-                % (len(alive), len(result["ports"]), len(result["names"]))
+                ">>> RECON COMPLETE: %d alive, %d with open ports, %d named (%.1fs)"
+                % (len(alive), len(result["ports"]), len(result["names"]),
+                   time.time() - t0)
             )
         except Exception as e:
             logging.exception("[wd_scanner] recon failed")
-            self._log_recon("recon failed: %s" % e)
+            self._log_recon("EXCEPTION during recon: %s" % e)
         finally:
             # 8. Tear everything down. Targeted only — NEVER kill all
             # wpa_supplicants on the system, that takes down the BT
             # tether/uplink that the user is using to reach this UI.
+            self._log_recon("tearing down recon connection...")
+            self._log_recon("  releasing DHCP lease on %s..." % iface)
             self._run(["dhclient", "-r", "-pf", dhcp_pid, "-lf", dhcp_lease, iface],
                       check=False, timeout=10)
             if wpa_started:
+                self._log_recon("  stopping wpa_supplicant (pid file: %s)..." % wpa_pid)
                 # First try the pidfile we just wrote.
                 self._run(["pkill", "-F", wpa_pid], check=False, timeout=5)
                 # Fallback: only target processes whose argv mentions THIS
@@ -1252,20 +1311,24 @@ class WdScanner(plugins.Plugin):
                     ["pkill", "-f", r"wpa_supplicant.*-i\s*%s(\s|$)" % re.escape(iface)],
                     check=False, timeout=5,
                 )
+                self._log_recon("  wpa_supplicant terminated")
 
             # Restore the iface to monitor mode if it was bettercap's.
             if was_shared:
+                self._log_recon("  restoring %s to monitor mode..." % iface)
                 self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
                 self._run(["iw", "dev", iface, "set", "type", "monitor"],
                           check=False, timeout=5)
                 self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
+                self._log_recon("  %s restored to monitor mode" % iface)
 
             if bettercap_paused_here:
+                self._log_recon("  resuming bettercap wifi.recon...")
                 try:
                     agent.run("wifi.recon on")
-                    self._log_recon("resumed bettercap recon")
+                    self._log_recon("  bettercap recon RESUMED — pwnagotchi back in control")
                 except Exception as e:
-                    self._log_recon("could not resume bettercap: %s" % e)
+                    self._log_recon("  ERROR: could not resume bettercap: %s" % e)
 
             # 9. Persist the report alongside the handshakes.
             result["duration_seconds"] = round(time.time() - t0, 1)
@@ -1285,6 +1348,7 @@ class WdScanner(plugins.Plugin):
             except Exception:
                 pass
 
+            self._log_recon(">>> RECON JOB FINISHED (total %.1fs)" % (time.time() - t0))
             self._recon_running = False
 
     # -------------------------------------------------------------- plunder
@@ -2173,7 +2237,7 @@ class WdScanner(plugins.Plugin):
                 self._select_error = "no password on file for %s" % (ssid or bssid)
                 return redirect("/plugins/wd_scanner/")
             self._start_recon(ssid, bssid, password)
-            return redirect("/plugins/wd_scanner/recon")
+            return redirect("/plugins/wd_scanner/")
 
         if norm == "recon" or norm == "recon/":
             return self._render_recon_list()

@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "1.3.0"
+    __version__ = "1.3.1"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -1659,11 +1659,25 @@ class WdScanner(plugins.Plugin):
 
     # ---------------------------------------------------------- HTML rendering
 
+    def _csrf_input(self):
+        """
+        Return a hidden CSRF token input that satisfies pwnagotchi's
+        Flask-WTF CSRF protection. Falls back to an empty string if we
+        are rendered outside an app context (e.g. unit tests / linting).
+        """
+        try:
+            from flask_wtf.csrf import generate_csrf
+            token = generate_csrf()
+        except Exception:
+            return ""
+        return "<input type='hidden' name='csrf_token' value='%s'>" % escape(token)
+
     def _render_index(self):
         # Enumerate wireless devices fresh on every render so name changes
         # (e.g. wlan1 -> wlan2 after replug) are picked up automatically.
         available = self._list_wireless_ifaces()
         has_iface = bool(self._iface_cfg)
+        csrf_input = self._csrf_input()
 
         # Build the picker dropdown.
         opt_lines = []
@@ -1726,11 +1740,12 @@ class WdScanner(plugins.Plugin):
                     "<form method='POST' action='/plugins/wd_scanner/shotgun' class='shot-chip-form'"
                     "      onsubmit=\"return confirm('// SHOTGUN ch{ch}\\n"
                     "Deauth all {n} BSSIDs on channel {ch} and listen 30s?');\">"
+                    "  {csrf}"
                     "  <input type='hidden' name='channel' value='{ch}'>"
                     "  <button type='submit' class='shot-chip' {disabled}>"
                     "    CH {ch} <span class='shot-n'>{n}</span>"
                     "  </button>"
-                    "</form>".format(ch=ch, n=n, disabled=disabled)
+                    "</form>".format(ch=ch, n=n, disabled=disabled, csrf=csrf_input)
                 )
             shotgun_panel_html = (
                 "<div class='shotgun'>"
@@ -1821,6 +1836,7 @@ class WdScanner(plugins.Plugin):
                 recon_btn = (
                     "  <form method='POST' action='/plugins/wd_scanner/recon' class='recon-form'"
                     "        onsubmit=\"return confirm('// RECON TARGET\\n{ssid_js}\\nConnect with known password and run nmap sweep?');\">"
+                    "    {csrf}"
                     "    <input type='hidden' name='bssid' value='{bssid}'>"
                     "    <input type='hidden' name='ssid' value='{ssid}'>"
                     "    <button type='submit' class='btn-recon' {recon_disabled}>"
@@ -1831,6 +1847,7 @@ class WdScanner(plugins.Plugin):
                     ssid=ssid_safe,
                     ssid_js=ssid_js,
                     bssid=escape(ap["bssid"]),
+                    csrf=csrf_input,
                     recon_disabled="disabled" if (
                         self._action_running or self._recon_running
                     ) else "",
@@ -1853,6 +1870,7 @@ class WdScanner(plugins.Plugin):
                 "  </dl>"
                 "  <form method='POST' action='/plugins/wd_scanner/deauth' class='hack-form'"
                 "        onsubmit=\"return confirm('{confirm}{ssid_js}\\nDeauth + capture?');\">"
+                "    {csrf}"
                 "    <input type='hidden' name='bssid' value='{bssid}'>"
                 "    <input type='hidden' name='channel' value='{ch}'>"
                 "    <input type='hidden' name='ssid' value='{ssid}'>"
@@ -1875,6 +1893,7 @@ class WdScanner(plugins.Plugin):
                     password_row=password_row,
                     confirm=confirm_msg,
                     label=hack_button_label,
+                    csrf=csrf_input,
                     disabled="disabled" if (self._action_running or not has_iface or self._recon_running) else "",
                     recon_btn=recon_btn,
                 )
@@ -2036,14 +2055,20 @@ body::before {{
 /* ---- iface picker ---- */
 .picker {{
   display: flex; gap: 8px; align-items: stretch;
+  flex-wrap: wrap;
   margin: 0 -12px 8px;
   padding: 10px;
   background: linear-gradient(180deg, #0a0e12, #07090b);
   border-bottom: 1px solid var(--grid);
 }}
-.picker form {{ display: flex; gap: 8px; flex: 1; }}
+.picker form {{
+  display: flex; gap: 8px; flex: 1 1 100%;
+  min-width: 0;
+}}
+.picker form.release {{ flex: 0 0 auto; }}
 .picker select {{
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 0;
   appearance: none; -webkit-appearance: none;
   background: #05080a;
   color: var(--cyan);
@@ -2063,6 +2088,9 @@ body::before {{
   box-shadow: 0 0 0 2px rgba(0,229,255,.2);
 }}
 .picker .btn {{ flex: 0 0 auto; padding: 0 14px; }}
+@media (min-width: 520px) {{
+  .picker form {{ flex: 1 1 auto; }}
+}}
 .err {{
   margin: 0 0 10px;
   padding: 8px 10px;
@@ -2492,12 +2520,14 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
 
   <div class='picker'>
     <form method='POST' action='/plugins/wd_scanner/select'>
+      {csrf}
       <select name='interface' aria-label='auxiliary radio' {pick_disabled}>
         {options}
       </select>
       <button type='submit' class='btn' {pick_disabled}>&#9711; SELECT</button>
     </form>
-    <form method='POST' action='/plugins/wd_scanner/release' style='flex:0 0 auto'>
+    <form method='POST' action='/plugins/wd_scanner/release' class='release'>
+      {csrf}
       <button type='submit' class='btn alt' {release_disabled}>&#10005; RELEASE</button>
     </form>
   </div>
@@ -2508,6 +2538,7 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
 
   <div class='toolbar'>
     <form method='POST' action='/plugins/wd_scanner/scan'>
+      {csrf}
       <input type='number' name='seconds' value='{secs}' min='5' max='300' inputmode='numeric' aria-label='scan seconds'>
       <button type='submit' class='btn' {scan_disabled}>&#9678; SCAN</button>
     </form>
@@ -2553,6 +2584,7 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
 </script>
 </body></html>
 """.format(
+            csrf=csrf_input,
             iface=escape(self._iface_cfg or "—"),
             mon=escape(self._mon_iface or "—"),
             scan_state=scan_state,
@@ -2630,6 +2662,7 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
         def _short(s):
             return (s[:12] + "...") if s and len(s) > 12 else (s or "—")
 
+        csrf_input = self._csrf_input()
         panel = (
             "<div class='upd'>"
             "  <h3>updates // {url_short}</h3>"
@@ -2641,10 +2674,12 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
             "  </dl>"
             "  <div class='upd-actions'>"
             "    <form method='POST' action='/plugins/wd_scanner/check_update'>"
+            "      {csrf}"
             "      <button type='submit' class='btn' {check_disabled}>&#8635; CHECK NOW</button>"
             "    </form>"
             "    <form method='POST' action='/plugins/wd_scanner/install_update'"
             "          onsubmit=\"return confirm('Install update from\\n{url_js}?');\">"
+            "      {csrf}"
             "      <button type='submit' class='btn alt' {install_disabled}>&#9660; INSTALL</button>"
             "    </form>"
             "  </div>"
@@ -2659,6 +2694,7 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
             last_check=escape(last_check),
             status=escape(last_status),
             cls=cls,
+            csrf=csrf_input,
             check_disabled=check_disabled,
             install_disabled=install_disabled,
         )

@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "1.4.0"
+    __version__ = "1.5.0"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -113,6 +113,14 @@ class WdScanner(plugins.Plugin):
         self._action_thread = None
         self._action_running = False
         self._action_log = []               # rolling log of last attack
+
+        # Handshake notification state.
+        self._new_handshakes = []             # list of filenames captured since last dismiss
+        self._handshake_toast_dismissed = 0   # epoch of last dismiss
+
+        # Background monitor thread (passive listening when idle).
+        self._bg_monitor_thread = None
+        self._bg_monitor_stop = threading.Event()
 
         # Recon-on-pwned state.
         self._recon_thread = None
@@ -194,6 +202,10 @@ class WdScanner(plugins.Plugin):
             logging.exception("[wd_scanner] auto-update check failed")
 
     def on_unload(self, ui):
+        try:
+            self._stop_bg_monitor()
+        except Exception:
+            pass
         try:
             self._stop_scan()
         except Exception:
@@ -633,6 +645,88 @@ class WdScanner(plugins.Plugin):
         finally:
             self._scan_running = False
 
+    # ------------------------------------------------------ background monitor
+
+    def _start_bg_monitor(self):
+        """Start background passive monitoring (refreshes network list when idle)."""
+        if self._bg_monitor_thread and self._bg_monitor_thread.is_alive():
+            return
+        self._bg_monitor_stop.clear()
+        self._bg_monitor_thread = threading.Thread(
+            target=self._bg_monitor_loop, daemon=True
+        )
+        self._bg_monitor_thread.start()
+
+    def _stop_bg_monitor(self):
+        self._bg_monitor_stop.set()
+
+    def _bg_monitor_loop(self):
+        """Continuously refresh the network list by polling bettercap session
+        every few seconds while the interface is selected and idle."""
+        while not self._bg_monitor_stop.is_set():
+            # Only poll when idle (no scan/attack/recon running) and iface selected.
+            if (self._iface_cfg and not self._scan_running
+                    and not self._action_running and not self._recon_running):
+                try:
+                    self._bg_poll_once()
+                except Exception:
+                    pass
+            # Sleep in small increments so we can stop quickly.
+            for _ in range(10):
+                if self._bg_monitor_stop.is_set():
+                    return
+                time.sleep(1)
+
+    def _bg_poll_once(self):
+        """Single passive refresh cycle."""
+        agent = self._agent
+        if agent is None:
+            return
+        try:
+            sess = agent.session() or {}
+            aps = (sess.get("wifi") or {}).get("aps") or []
+        except Exception:
+            return
+        best = {}
+        for a in aps:
+            bssid = (a.get("mac") or a.get("bssid") or "").lower()
+            if not re.match(r"^[0-9a-f:]{17}$", bssid):
+                continue
+            ssid = a.get("hostname") or a.get("ssid") or "<hidden>"
+            try:
+                ch = int(a.get("channel") or 0)
+            except (TypeError, ValueError):
+                ch = 0
+            try:
+                rssi = int(a.get("rssi") or -100)
+            except (TypeError, ValueError):
+                rssi = -100
+            clients = a.get("clients") or []
+            cl = len(clients) if isinstance(clients, list) else 0
+            cur = best.get(bssid)
+            if (cur is None) or (rssi > cur["power"]):
+                best[bssid] = {
+                    "bssid": bssid,
+                    "channel": ch,
+                    "power": rssi,
+                    "ssid": ssid or "<hidden>",
+                    "clients": cl,
+                }
+            elif cl > cur["clients"]:
+                cur["clients"] = cl
+
+        if best:
+            results = list(best.values())
+            def _rank(a):
+                p = a["power"]
+                if p == -1:
+                    p = -100
+                return -p
+            results.sort(key=_rank)
+            self._last_scan_results = results
+
+    # ------------------------------------------------------------------ CSV
+
     @staticmethod
     def _parse_airodump_csv(path):
         """
@@ -811,6 +905,7 @@ class WdScanner(plugins.Plugin):
             if new:
                 for n in new:
                     self._log_action("captured handshake: %s" % n)
+                self._new_handshakes.extend(new)
             else:
                 self._log_action("shotgun ch%d: no new handshakes" % channel)
         finally:
@@ -859,6 +954,7 @@ class WdScanner(plugins.Plugin):
             if new:
                 for n in new:
                     self._log_action("captured handshake: %s" % n)
+                self._new_handshakes.extend(new)
             else:
                 self._log_action("no new handshake files appeared in %s" % handshake_dir)
         finally:
@@ -1611,9 +1707,12 @@ class WdScanner(plugins.Plugin):
             ok, msg = self._select_iface(name)
             if not ok:
                 self._select_error = msg
+            else:
+                self._start_bg_monitor()
             return redirect("/plugins/wd_scanner/")
 
         if req.method == "POST" and norm == "release":
+            self._stop_bg_monitor()
             self._release_iface()
             return redirect("/plugins/wd_scanner/")
 
@@ -1709,6 +1808,11 @@ class WdScanner(plugins.Plugin):
             threading.Timer(1.5, _restart).start()
             return redirect("/plugins/wd_scanner/")
 
+        if req.method == "POST" and norm == "dismiss_handshakes":
+            self._new_handshakes = []
+            self._handshake_toast_dismissed = time.time()
+            return jsonify({"ok": True})
+
         if norm == "status.json":
             return jsonify({
                 "scan_running": self._scan_running,
@@ -1735,6 +1839,7 @@ class WdScanner(plugins.Plugin):
                     "auto_install": self._update_auto_install,
                     "pending_restart": self._update_pending_restart,
                 },
+                "new_handshakes": list(self._new_handshakes),
             })
 
         return self._render_index()
@@ -1765,25 +1870,38 @@ class WdScanner(plugins.Plugin):
         opt_lines = []
         seen_current = False
         for it in available:
-            sel = " selected" if it["name"] == self._iface_cfg else ""
-            if sel:
+            # Match both _iface_cfg and _mon_iface since airmon-ng may have
+            # renamed the interface (e.g. wlan1 -> wlan1mon).
+            is_cur = (it["name"] == self._iface_cfg or
+                      (self._mon_iface and it["name"] == self._mon_iface))
+            sel = " selected" if is_cur else ""
+            if is_cur:
                 seen_current = True
             shared_attr = " data-role='shared'" if it.get("shared") else ""
             tag = "shared" if it.get("shared") else it["type"]
             label = "%s  [%s]" % (it["name"], tag)
             if it.get("addr"):
                 label += "  %s" % it["addr"]
+            if is_cur and it["name"] != self._iface_cfg:
+                # Show original name for clarity (e.g. "wlan1mon [monitor ← wlan1]")
+                label = "%s  [monitor ← %s]" % (it["name"], self._iface_cfg)
             opt_lines.append(
                 "<option value='{n}'{sel}{shared_attr}>{lbl}</option>".format(
-                    n=escape(it["name"]), sel=sel, shared_attr=shared_attr,
+                    n=escape(self._iface_cfg if is_cur else it["name"]),
+                    sel=sel, shared_attr=shared_attr,
                     lbl=escape(label),
                 )
             )
-        # If the currently selected iface has vanished (e.g. unplugged) keep
-        # it visible so the user knows what's set.
+        # If the currently selected iface has vanished from the live list it's
+        # usually because airmon-ng renamed it (wlan1 -> wlan1mon). Show the
+        # monitor name so the user knows it's active, not "missing".
         if has_iface and not seen_current:
-            opt_lines.insert(0, "<option value='{n}' selected>{n}  [missing]</option>".format(
-                n=escape(self._iface_cfg)))
+            if self._mon_iface and self._iface_exists(self._mon_iface):
+                label = "%s  [monitor ← %s]" % (self._mon_iface, self._iface_cfg)
+            else:
+                label = "%s  [missing]" % self._iface_cfg
+            opt_lines.insert(0, "<option value='{n}' selected>{lbl}</option>".format(
+                n=escape(self._iface_cfg), lbl=escape(label)))
         if not opt_lines:
             opt_lines.append("<option value='' disabled selected>// no wireless devices //</option>")
 
@@ -2554,6 +2672,36 @@ footer.tag {{
   font-size: 10px; letter-spacing: .35em;
 }}
 
+/* ---- handshake toast notification ---- */
+.toast {{
+  display: none;
+  position: fixed; bottom: 16px; left: 12px; right: 12px;
+  max-width: 400px; margin: 0 auto;
+  padding: 14px 16px;
+  background: linear-gradient(135deg, #0a2e0a, #0d1f0d);
+  border: 1px solid var(--green);
+  color: var(--green);
+  font: inherit; font-size: 13px; letter-spacing: .1em;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+  z-index: 100;
+  box-shadow: 0 0 24px rgba(43,255,136,.25);
+  animation: toast-pulse .8s ease-in-out infinite alternate;
+}}
+.toast.visible {{ display: flex; align-items: center; gap: 10px; }}
+.toast .toast-msg {{ flex: 1; }}
+.toast .toast-dismiss {{
+  appearance: none; -webkit-appearance: none;
+  background: transparent; border: 1px solid var(--green); color: var(--green);
+  font: inherit; font-size: 11px; letter-spacing: .15em;
+  padding: 6px 12px; cursor: pointer;
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+}}
+.toast .toast-dismiss:active {{ background: rgba(43,255,136,.15); }}
+@keyframes toast-pulse {{
+  from {{ box-shadow: 0 0 10px rgba(43,255,136,.15); }}
+  to   {{ box-shadow: 0 0 24px rgba(43,255,136,.4); }}
+}}
+
 /* ---- larger phones / small tablets ---- */
 @media (min-width: 560px) {{
   body {{ font-size: 15px; }}
@@ -2679,6 +2827,12 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
 
   <footer class='tag'>// the truth will set us free //</footer>
 </div>
+
+<div class='toast' id='wd-toast'>
+  <span class='toast-msg' id='wd-toast-msg'></span>
+  <button class='toast-dismiss' id='wd-toast-dismiss'>DISMISS</button>
+</div>
+
 <script>
 (function () {{
   // ---- Copy-to-clipboard handler ----
@@ -2726,11 +2880,51 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
     localStorage.setItem(GRID_KEY, nowCollapsed ? '1' : '0');
   }});
 
+  // ---- Handshake toast notification ----
+  var toast = document.getElementById('wd-toast');
+  var toastMsg = document.getElementById('wd-toast-msg');
+  var toastDismiss = document.getElementById('wd-toast-dismiss');
+  var knownHandshakes = [];  // track what we've already shown
+
+  function showToast(files) {{
+    var n = files.length;
+    toastMsg.textContent = '\\u2620 CAPTURED ' + n + ' handshake' + (n > 1 ? 's' : '') + ': ' + files.join(', ');
+    toast.classList.add('visible');
+  }}
+
+  function hideToast() {{
+    toast.classList.remove('visible');
+    fetch('/plugins/wd_scanner/dismiss_handshakes', {{
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+      body: 'csrf_token=' + encodeURIComponent(
+        (document.querySelector("input[name=csrf_token]") || {{}}).value || ''
+      )
+    }}).catch(function () {{}});
+  }}
+
+  toastDismiss.addEventListener('click', hideToast);
+
   // ---- Partial reload: swap only dynamic panes every 5 s ----
   var PANES = ['wd-status', 'wd-shotgun', 'wd-grid', 'wd-log', 'wd-recon'];
 
   function partialRefresh() {{
     var isCollapsed = grid.classList.contains('collapsed');
+    fetch('/plugins/wd_scanner/status.json', {{ credentials: 'same-origin' }})
+      .then(function (r) {{ return r.ok ? r.json() : null; }})
+      .then(function (data) {{
+        if (!data) return;
+        // Check for new handshakes.
+        var nh = data.new_handshakes || [];
+        if (nh.length > 0 && JSON.stringify(nh) !== JSON.stringify(knownHandshakes)) {{
+          knownHandshakes = nh;
+          showToast(nh);
+        }}
+      }})
+      .catch(function () {{}});
+
+    // Also refresh the HTML panes.
     fetch(window.location.href, {{ credentials: 'same-origin' }})
       .then(function (r) {{ return r.ok ? r.text() : null; }})
       .then(function (html) {{

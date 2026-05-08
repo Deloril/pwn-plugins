@@ -72,7 +72,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.6.0"
+    __version__ = "2.6.1"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -232,14 +232,6 @@ class WdScanner(plugins.Plugin):
             logging.error("[wd_scanner] aircrack-ng suite not found on PATH.")
             return
 
-        # Setup notes file.
-        try:
-            handshakes = self._agent.config()["bettercap"]["handshakes"]
-            self._notes_file = os.path.join(handshakes, "wd_scanner_notes.json")
-            self._load_notes()
-        except Exception:
-            self._notes_file = None
-
         try:
             self._update_local_sha = self._sha256_of_self()
         except Exception:
@@ -256,6 +248,16 @@ class WdScanner(plugins.Plugin):
 
     def on_ready(self, agent):
         self._agent = agent
+
+        # Setup notes file now that agent is available.
+        try:
+            handshakes = agent.config()["bettercap"]["handshakes"]
+            self._notes_file = os.path.join(handshakes, "wd_scanner_notes.json")
+            self._load_notes()
+        except Exception as e:
+            logging.warning("[wd_scanner] failed to setup notes file: %s", e)
+            self._notes_file = None
+
         logging.info("[wd_scanner] agent ready, plugin armed.")
 
     def on_internet_available(self, agent):
@@ -1286,31 +1288,35 @@ class WdScanner(plugins.Plugin):
         """
         Decide which physical interface we'll use for recon. We need a
         managed-mode capable iface. Strategy:
-          - Exclude any interface currently in use for scanning.
-          - Prefer a dedicated radio (not the one bettercap is on).
+          - Prefer a dedicated radio (not the one bettercap is on and not scanning).
+          - If only scanning radio available, use it (we'll handle the transition).
           - Otherwise fall back to whatever phy backs pwnagotchi's main
             radio: take down the monitor vif, bring the parent up in
             managed mode.
 
-        Returns (iface_name, was_shared) or (None, None) on failure.
+        Returns (iface_name, was_shared, is_scan_iface) or (None, None, False) on failure.
         """
         main_iface = pwnagotchi_config_main_iface()
         main_phy = self._iface_phy(main_iface) if main_iface else None
 
-        # Build exclusion list: don't use interfaces currently in use for scanning.
-        excluded = set()
+        # Build list of interfaces currently in use for scanning.
+        scan_ifaces = set()
         if self._mon_iface:
-            excluded.add(self._mon_iface)
+            scan_ifaces.add(self._mon_iface)
         if self._iface_cfg:
-            excluded.add(self._iface_cfg)
+            scan_ifaces.add(self._iface_cfg)
 
-        # Look for a dedicated radio first.
+        # Look for a dedicated radio first (not used for scanning).
         for it in self._list_wireless_ifaces():
             iface_name = it.get("name")
-            if iface_name in excluded:
+            if iface_name in scan_ifaces:
                 continue
             if not it.get("shared") and iface_name != main_iface:
-                return iface_name, False
+                return iface_name, False, False
+
+        # If we have a scanning interface, use it (temporarily take it over).
+        if self._iface_cfg:
+            return self._iface_cfg, self._shared_radio, True
 
         # Fall back to the parent of pwnagotchi's monitor vif.
         # main_iface is usually `mon0`; we want the parent (`wlan0`).
@@ -1321,17 +1327,15 @@ class WdScanner(plugins.Plugin):
                         continue
                     if n == main_iface:
                         continue
-                    if n in excluded:
-                        continue
                     if self._iface_phy(n) == main_phy:
-                        return n, True
+                        return n, True, False
             except OSError:
                 pass
 
-        # Last resort: use the main iface itself (only if not excluded).
-        if main_iface and main_iface not in excluded:
-            return main_iface, True
-        return None, None
+        # Last resort: use the main iface itself.
+        if main_iface:
+            return main_iface, True, False
+        return None, None, False
 
     @staticmethod
     def _wpa_psk_safe(s):
@@ -1344,15 +1348,18 @@ class WdScanner(plugins.Plugin):
         agent = self._agent
         self._log_recon(">>> RECON STARTED — target SSID=%s BSSID=%s" % (ssid, bssid))
         self._log_recon("selecting interface for recon...")
-        iface, was_shared = self._pick_recon_iface()
+        iface, was_shared, is_scan_iface = self._pick_recon_iface()
         if not iface:
             self._log_recon("ABORT: no usable interface for recon")
             self._recon_running = False
             return
 
-        self._log_recon("recon iface selected: %s%s" % (
-            iface, " [SHARED — pwnagotchi will pause]" if was_shared else " [DEDICATED]"
-        ))
+        if is_scan_iface:
+            self._log_recon("recon iface selected: %s [SCAN IFACE — will temporarily take over]" % iface)
+        else:
+            self._log_recon("recon iface selected: %s%s" % (
+                iface, " [SHARED — pwnagotchi will pause]" if was_shared else " [DEDICATED]"
+            ))
 
         # Tooling check.
         self._log_recon("checking required tools...")
@@ -1433,17 +1440,28 @@ class WdScanner(plugins.Plugin):
             except Exception as e:
                 self._log_recon("  WARNING: could not pause bettercap: %s" % e)
 
-            # If our iface is currently a monitor vif, take it down and put
-            # it back to managed. Same for shared mode where the parent radio
-            # might still be in monitor.
-            self._log_recon("step 2/7: switching %s from monitor → managed mode..." % iface)
-            self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
-            self._log_recon("  %s brought DOWN" % iface)
-            self._run(["iw", "dev", iface, "set", "type", "managed"],
-                      check=False, timeout=5)
-            self._log_recon("  %s set to MANAGED mode" % iface)
-            self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
-            self._log_recon("  %s brought UP in managed mode" % iface)
+            # If our iface is currently a monitor vif, we need to get back to the parent.
+            # If it's a "mon" interface created by airmon-ng, stop it to get parent back.
+            parent_iface = iface
+            if "mon" in iface.lower():
+                self._log_recon("step 2/7: detected monitor interface %s, stopping to get parent..." % iface)
+                stop_result = self._run(["airmon-ng", "stop", iface], check=False, timeout=10)
+                self._log_recon("  airmon-ng stop output: %s" % stop_result[:200] if stop_result else "")
+                # Extract parent interface name (usually the original name without "mon").
+                # e.g., "wlan1mon" -> "wlan1"
+                parent_iface = iface.replace("mon", "")
+                self._log_recon("  parent interface: %s" % parent_iface)
+                iface = parent_iface
+            else:
+                # Regular interface, just switch mode.
+                self._log_recon("step 2/7: switching %s from monitor → managed mode..." % iface)
+                self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
+                self._log_recon("  %s brought DOWN" % iface)
+                self._run(["iw", "dev", iface, "set", "type", "managed"],
+                          check=False, timeout=5)
+                self._log_recon("  %s set to MANAGED mode" % iface)
+                self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
+                self._log_recon("  %s brought UP in managed mode" % iface)
 
             # 2. Start wpa_supplicant in the background.
             self._log_recon("step 3/7: starting wpa_supplicant...")
@@ -1673,11 +1691,14 @@ class WdScanner(plugins.Plugin):
     def _plunder_worker(self, ssid, bssid, password, targets):
         """Connect to network, enumerate/download from all plunderable hosts."""
         agent = self._agent
-        iface, was_shared = self._pick_recon_iface()
+        iface, was_shared, is_scan_iface = self._pick_recon_iface()
         if not iface:
             self._log_plunder("no usable interface for plunder")
             self._plunder_running = False
             return
+
+        if is_scan_iface:
+            self._log_plunder("using scan interface %s (will temporarily take over)" % iface)
 
         self._log_plunder("plunder target network: %s (%s)" % (ssid, bssid))
         self._log_plunder("hosts to plunder: %d" % len(targets))

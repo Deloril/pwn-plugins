@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.0.0"
+    __version__ = "2.1.0"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -2440,12 +2440,18 @@ class WdScanner(plugins.Plugin):
         # surface the password and mark the card as PWNED.
         cracked = self._load_cracked_index()
 
-        # Build one card per AP. Mobile-first stacked layout.
-        cards = []
+        # Group APs by SSID for cleaner display when same network has
+        # multiple BSSIDs (e.g. mesh / multi-AP setups).
+        from collections import OrderedDict
+        ssid_groups = OrderedDict()  # ssid_lower -> [ap, ...]
         for ap in self._last_scan_results:
+            key = ap["ssid"].lower()
+            ssid_groups.setdefault(key, []).append(ap)
+
+        def _render_ap_card(ap, show_ssid_header=True, grouped=False):
+            """Render a single AP card (or sub-card within a group)."""
             ssid_safe = escape(ap["ssid"])
             ssid_js = ssid_safe.replace("'", "").replace("\\", "")
-            # Signal pips: airodump power is dBm-ish, often negative.
             pwr = ap["power"]
             if pwr >= -55:
                 bars, bar_cls = 4, "s4"
@@ -2469,7 +2475,7 @@ class WdScanner(plugins.Plugin):
                 badge = "<span class='badge-pwned' title='already cracked'>&#x2713; PWNED</span>"
 
             password_row = ""
-            if is_pwned:
+            if is_pwned and not grouped:
                 pw_safe = escape(password)
                 password_row = (
                     "<div class='pw'>"
@@ -2496,7 +2502,7 @@ class WdScanner(plugins.Plugin):
             )
 
             recon_btn = ""
-            if is_pwned:
+            if is_pwned and not grouped:
                 recon_btn = (
                     "  <form method='POST' action='/plugins/wd_scanner/recon' class='recon-form'"
                     "        onsubmit=\"return confirm('// RECON TARGET\\n{ssid_js}\\nConnect with known password and run nmap sweep?');\">"
@@ -2517,14 +2523,21 @@ class WdScanner(plugins.Plugin):
                     ) else "",
                 )
 
-            cards.append(
-                "<article class='node{pwned_cls}'>"
-                "  <header class='node-h'>"
-                "    <span class='ssid'>{ssid}{badge}</span>"
-                "    <span class='sig {bar_cls}' aria-label='signal'>"
-                "      <i></i><i></i><i></i><i></i>"
-                "    </span>"
-                "  </header>"
+            cls_extra = pwned_cls + (" node-sub" if grouped else "")
+            header_html = ""
+            if show_ssid_header:
+                header_html = (
+                    "  <header class='node-h'>"
+                    "    <span class='ssid'>{ssid}{badge}</span>"
+                    "    <span class='sig {bar_cls}' aria-label='signal'>"
+                    "      <i></i><i></i><i></i><i></i>"
+                    "    </span>"
+                    "  </header>"
+                ).format(ssid=ssid_safe, badge=badge, bar_cls=bar_cls)
+
+            return (
+                "<article class='node{cls_extra}'>"
+                "  {header_html}"
                 "  <dl class='meta'>"
                 "    <div><dt>BSSID</dt><dd><code>{bssid}</code></dd></div>"
                 "    <div><dt>CH</dt><dd>{ch}</dd></div>"
@@ -2543,25 +2556,102 @@ class WdScanner(plugins.Plugin):
                 "    </button>"
                 "  </form>"
                 "  {recon_btn}"
-                "</article>".format(
-                    ssid=ssid_safe,
-                    ssid_js=ssid_js,
-                    bssid=escape(ap["bssid"]),
-                    ch=ap["channel"],
-                    pwr=pwr,
-                    cl=cl,
-                    cl_cls=cl_cls,
-                    bar_cls=bar_cls,
-                    pwned_cls=pwned_cls,
-                    badge=badge,
-                    password_row=password_row,
-                    confirm=confirm_msg,
-                    label=hack_button_label,
-                    csrf=csrf_input,
-                    disabled="disabled" if (self._action_running or not has_iface or self._recon_running) else "",
+                "</article>"
+            ).format(
+                cls_extra=cls_extra,
+                header_html=header_html,
+                ssid=ssid_safe,
+                ssid_js=ssid_js,
+                bssid=escape(ap["bssid"]),
+                ch=ap["channel"],
+                pwr=pwr,
+                cl=cl,
+                cl_cls=cl_cls,
+                bar_cls=bar_cls,
+                password_row=password_row,
+                confirm=confirm_msg,
+                label=hack_button_label,
+                csrf=csrf_input,
+                disabled="disabled" if (self._action_running or not has_iface or self._recon_running) else "",
+                recon_btn=recon_btn,
+            )
+
+        # Build cards, grouping multi-BSSID SSIDs.
+        cards = []
+        for ssid_key, group in ssid_groups.items():
+            if len(group) == 1:
+                # Single BSSID — render normally.
+                cards.append(_render_ap_card(group[0], show_ssid_header=True, grouped=False))
+            else:
+                # Multiple BSSIDs — group header + sub-cards.
+                best_ap = group[0]  # already sorted by signal
+                ssid_safe = escape(best_ap["ssid"])
+                password = (
+                    cracked.get(best_ap["bssid"].lower())
+                    or cracked.get("ssid::" + best_ap["ssid"].lower())
+                )
+                is_pwned = password is not None
+                pwned_cls = " pwned" if is_pwned else ""
+                badge = ""
+                if is_pwned:
+                    badge = "<span class='badge-pwned' title='already cracked'>&#x2713; PWNED</span>"
+                pw_row = ""
+                if is_pwned:
+                    pw_safe = escape(password)
+                    pw_row = (
+                        "<div class='pw'>"
+                        "<dt>PASSWORD</dt>"
+                        "<dd><code class='pw-val'>{pw}</code>"
+                        "<button type='button' class='copy' "
+                        "data-pw='{pw_attr}' aria-label='copy password'>copy</button>"
+                        "</dd>"
+                        "</div>".format(
+                            pw=pw_safe,
+                            pw_attr=pw_safe.replace("&#x27;", "&apos;"),
+                        )
+                    )
+                recon_btn = ""
+                if is_pwned:
+                    ssid_js = ssid_safe.replace("'", "").replace("\\", "")
+                    recon_btn = (
+                        "  <form method='POST' action='/plugins/wd_scanner/recon' class='recon-form'"
+                        "        onsubmit=\"return confirm('// RECON TARGET\\n{ssid_js}\\nConnect with known password and run nmap sweep?');\">"
+                        "    {csrf}"
+                        "    <input type='hidden' name='bssid' value='{bssid}'>"
+                        "    <input type='hidden' name='ssid' value='{ssid}'>"
+                        "    <button type='submit' class='btn-recon' {recon_disabled}>"
+                        "      <span class='glyph'>&#x1f50d;</span> RECON"
+                        "    </button>"
+                        "  </form>"
+                    ).format(
+                        ssid=ssid_safe,
+                        ssid_js=ssid_js,
+                        bssid=escape(best_ap["bssid"]),
+                        csrf=csrf_input,
+                        recon_disabled="disabled" if (
+                            self._action_running or self._recon_running
+                        ) else "",
+                    )
+
+                total_clients = sum(a["clients"] for a in group)
+                group_header = (
+                    "<div class='node-group{pwned_cls}'>"
+                    "  <header class='node-h'>"
+                    "    <span class='ssid'>{ssid}{badge}</span>"
+                    "    <span class='group-count'>{n} APs &middot; {cl} nodes</span>"
+                    "  </header>"
+                    "  <dl class='meta'>{pw_row}</dl>"
+                    "  {recon_btn}"
+                    "  <div class='node-group-items'>"
+                ).format(
+                    ssid=ssid_safe, badge=badge, pwned_cls=pwned_cls,
+                    n=len(group), cl=total_clients, pw_row=pw_row,
                     recon_btn=recon_btn,
                 )
-            )
+                cards.append(group_header)
+                for ap in group:
+                    cards.append(_render_ap_card(ap, show_ssid_header=False, grouped=True))
+                cards.append("  </div></div>")
 
         scan_state = "RUNNING" if self._scan_running else "IDLE"
         attack_state = "RUNNING" if self._action_running else "IDLE"
@@ -2908,6 +2998,49 @@ body::before {{
 }}
 .pw .copy:active {{ transform: translateY(1px); }}
 .pw .copy.ok {{ background: var(--green); color: #002912; }}
+
+/* ---- SSID group (multiple BSSIDs) ---- */
+.node-group {{
+  border: 1px solid var(--grid);
+  background: linear-gradient(180deg, #0b1016, #080b0f);
+  padding: 12px;
+  clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
+  position: relative;
+}}
+.node-group::before {{
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0;
+  width: 3px; background: var(--cyan);
+  box-shadow: 0 0 10px rgba(0,229,255,.4);
+}}
+.node-group.pwned {{
+  border-color: var(--green);
+  background: linear-gradient(180deg, #091a0f, #060f09);
+}}
+.node-group.pwned::before {{
+  background: var(--green);
+  box-shadow: 0 0 12px rgba(43,255,136,.6);
+}}
+.node-group.pwned .ssid {{ color: var(--green); text-shadow: 0 0 8px rgba(43,255,136,.4); }}
+.group-count {{
+  font-size: 11px; letter-spacing: .15em; color: var(--mute);
+  flex-shrink: 0;
+}}
+.node-group-items {{
+  display: grid; gap: 6px; margin-top: 10px;
+  padding-top: 10px; border-top: 1px solid var(--grid);
+}}
+.node-sub {{
+  padding: 8px 10px;
+  clip-path: none;
+  border-left: 2px solid var(--grid);
+  background: rgba(255,255,255,.02);
+}}
+.node-sub::before {{ display: none; }}
+.node-sub.pwned {{
+  border-left-color: var(--green);
+  background: rgba(43,255,136,.03);
+  box-shadow: none;
+}}
 
 .node.pwned .btn-hack {{
   background: linear-gradient(180deg, #052618, #021a0e);

@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "1.3.3"
+    __version__ = "1.3.4"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -1984,7 +1984,6 @@ class WdScanner(plugins.Plugin):
 <meta charset='utf-8'>
 <meta name='viewport' content='width=device-width, initial-scale=1, viewport-fit=cover'>
 <meta name='theme-color' content='#0a0d10'>
-<meta http-equiv='refresh' content='5'>
 <title>ctOS // wd_scanner</title>
 <style>
 :root {{
@@ -2592,7 +2591,7 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
     <a href='/plugins/wd_scanner/recon'>RECON <span class='count cyan'>{recon_count}</span></a>
   </nav>
 
-  <div class='status'>
+  <div class='status' id='wd-status'>
     <div class='chip'><span class='k'>aux iface</span><span class='v'>{iface}</span></div>
     <div class='chip'><span class='k'>monitor</span><span class='v'>{mon}</span></div>
     <div class='chip {scan_cls}'><span class='k'>scan</span><span class='v'>{scan_state}</span></div>
@@ -2631,17 +2630,17 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
     </form>
   </div>
 
-  {shotgun_panel}
+  <div id='wd-shotgun'>{shotgun_panel}</div>
 
   <div class='section-h'>nodes detected</div>
-  <div class='grid'>
+  <div class='grid' id='wd-grid'>
     {cards}
   </div>
 
   <div class='section-h'>action log</div>
-  <pre class='log'>{log}</pre>
+  <pre class='log' id='wd-log'>{log}</pre>
 
-  {recon_panel}
+  <div id='wd-recon'>{recon_panel}</div>
 
   {update_panel}
 
@@ -2649,6 +2648,7 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
 </div>
 <script>
 (function () {{
+  // ---- Copy-to-clipboard handler ----
   document.addEventListener('click', function (ev) {{
     var t = ev.target;
     if (!t || !t.classList || !t.classList.contains('copy')) return;
@@ -2667,6 +2667,29 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
       document.body.removeChild(ta);
     }}
   }});
+
+  // ---- Partial reload: swap only dynamic panes every 5 s ----
+  var PANES = ['wd-status', 'wd-shotgun', 'wd-grid', 'wd-log', 'wd-recon'];
+
+  function partialRefresh() {{
+    fetch(window.location.href, {{ credentials: 'same-origin' }})
+      .then(function (r) {{ return r.ok ? r.text() : null; }})
+      .then(function (html) {{
+        if (!html) return;
+        var doc = new DOMParser().parseFromString(html, 'text/html');
+        for (var i = 0; i < PANES.length; i++) {{
+          var id = PANES[i];
+          var fresh = doc.getElementById(id);
+          var local = document.getElementById(id);
+          if (fresh && local) {{
+            local.innerHTML = fresh.innerHTML;
+          }}
+        }}
+      }})
+      .catch(function () {{}});
+  }}
+
+  setInterval(partialRefresh, 5000);
 }})();
 </script>
 </body></html>

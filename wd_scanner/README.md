@@ -6,9 +6,12 @@ handshakes into pwnagotchi's normal pipeline, and (for networks the
 existing crackers have already broken) **logging in with the known
 password, running LAN recon, and plundering open network services**.
 
-Works on **two-radio** rigs (USB monitor dongle + onboard) and on
-**single-radio** rigs (Pi Zero W with just `wlan0`) by politely pausing
-pwnagotchi for the duration of an attack/recon and resuming when done.
+**Multi-radio support:**
+- **Single-radio**: Pi Zero W with just `wlan0` (shared mode — pwnagotchi pauses during operations)
+- **Dual-radio**: Main radio + 1 auxiliary USB dongle (targeted attacks + scanning)
+- **Triple-radio**: Main + auxiliary + passive monitor (continuous all-channel handshake capture)
+
+The plugin works seamlessly across all configurations by detecting available radios at runtime.
 
 ---
 
@@ -34,8 +37,9 @@ over USB tether at `http://10.0.0.2:8080`.
 
 ## What it does
 
-### 1. Pick a radio at runtime
+### 1. Radio selection (up to 3 radios)
 
+**Primary auxiliary radio (scan + attack):**  
 A dropdown enumerates every wireless device fresh on every page render.
 Replug a USB dongle and it shows up under whatever name the kernel gives
 it. Each option is tagged `[managed]`, `[monitor]` or `[shared]`. Shared
@@ -45,6 +49,20 @@ work.
 
 When a radio is put into monitor mode (e.g. `wlan1` becomes `wlan1mon`),
 the picker shows `wlan1mon [monitor <- wlan1]` so you know it's active.
+
+**Passive monitor radio (3rd radio — optional):**  
+Select a third radio for continuous passive handshake capture across all
+2.4GHz channels (1-13). This radio runs `airodump-ng` with channel hopping
+in the background, captures handshakes, verifies them with `aircrack-ng`,
+and automatically feeds them into pwnagotchi's handshake folder. The
+passive monitor operates independently — it never interferes with active
+scanning or attacks on the auxiliary radio. Captured handshakes appear
+in the handshake toast notification alongside those from targeted attacks.
+
+**Radio allocation summary:**
+- **Radio 1 (pwnagotchi main)**: bettercap normal operation
+- **Radio 2 (auxiliary)**: targeted scanning, deauth attacks, recon, plunder
+- **Radio 3 (passive monitor)**: continuous all-channel handshake capture
 
 ### 2. Scan + background monitoring
 

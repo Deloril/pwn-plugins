@@ -72,7 +72,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.6.3"
+    __version__ = "2.7.0"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -104,6 +104,15 @@ class WdScanner(plugins.Plugin):
         # `True` iff the user has explicitly selected the main radio in
         # shared mode. Useful for UI badges.
         self._allow_shared = True
+
+        # Passive monitor radio (third radio for continuous handshake capture).
+        self._passive_iface_cfg = None      # passive monitor iface (user-picked)
+        self._passive_mon_iface = None      # actual mon iface after airmon-ng
+        self._passive_thread = None         # airodump-ng thread
+        self._passive_running = False
+        self._passive_stop = threading.Event()
+        self._passive_log = []              # rolling log
+        self._passive_handshakes = 0        # counter of handshakes captured
 
         self._scan_thread = None
         self._scan_running = False
@@ -282,7 +291,15 @@ class WdScanner(plugins.Plugin):
         except Exception:
             pass
         try:
+            self._stop_passive_monitor()
+        except Exception:
+            pass
+        try:
             self._restore_managed_mode()
+        except Exception:
+            pass
+        try:
+            self._restore_passive_managed_mode()
         except Exception:
             pass
         logging.info("[wd_scanner] unloaded.")
@@ -533,6 +550,67 @@ class WdScanner(plugins.Plugin):
             self._last_scan_error = None
             return True, "released"
 
+    def _select_passive_iface(self, name):
+        """Select the passive monitor radio (third radio for continuous capture)."""
+        with self._lock:
+            self._select_error = None
+
+            if not self._iface_name_ok(name):
+                return False, "invalid interface name"
+
+            if not os.path.isdir("/sys/class/net/%s" % name):
+                return False, "%s does not exist" % name
+
+            # Make sure it's not the main radio or the active aux radio.
+            main_iface = pwnagotchi_config_main_iface()
+            if name == main_iface or name == self._iface_cfg:
+                return False, "%s is already in use" % name
+
+            # Stop existing passive monitor if running.
+            if self._passive_running:
+                self._stop_passive_monitor()
+
+            # Release old passive interface if any.
+            if self._passive_mon_iface:
+                self._restore_passive_managed_mode()
+
+            self._passive_iface_cfg = name
+
+            # Put it into monitor mode.
+            self._unmanage_iface(name)
+            result = self._run(["airmon-ng", "start", name], check=False, timeout=15)
+            if not result:
+                self._passive_iface_cfg = None
+                return False, "airmon-ng failed for %s" % name
+
+            # Detect the monitor interface name.
+            mon_iface = None
+            for line in result.split("\n"):
+                m = re.search(r"monitor mode (?:vif )?enabled (?:for|on) (\w+)", line, re.I)
+                if m:
+                    mon_iface = m.group(1)
+                    break
+            if not mon_iface:
+                mon_iface = name + "mon"
+                if not os.path.isdir("/sys/class/net/%s" % mon_iface):
+                    self._passive_iface_cfg = None
+                    return False, "could not find monitor interface"
+
+            self._passive_mon_iface = mon_iface
+
+            # Start passive monitoring.
+            self._start_passive_monitor()
+
+            return True, "passive monitor started on %s (mon=%s)" % (name, mon_iface)
+
+    def _release_passive_iface(self):
+        """Release the passive monitor radio."""
+        with self._lock:
+            self._stop_passive_monitor()
+            self._restore_passive_managed_mode()
+            self._passive_iface_cfg = None
+            return True, "released passive monitor"
+
     # ------------------------------------------------- pwnagotchi pause/resume
 
     def _pause_pwnagotchi(self):
@@ -620,6 +698,15 @@ class WdScanner(plugins.Plugin):
         if self._iface_cfg:
             self._remanage_iface(self._iface_cfg)
         self._mon_iface = None
+
+    def _restore_passive_managed_mode(self):
+        """Restore passive monitor radio to managed mode."""
+        if not self._passive_mon_iface:
+            return
+        self._run(["airmon-ng", "stop", self._passive_mon_iface], check=False, timeout=15)
+        if self._passive_iface_cfg:
+            self._remanage_iface(self._passive_iface_cfg)
+        self._passive_mon_iface = None
 
     # ------------------------------------ targeted (non-global) unmanage ----
 
@@ -900,6 +987,160 @@ class WdScanner(plugins.Plugin):
                 return -p
             results.sort(key=_rank)
             self._last_scan_results = results
+
+    # -------------------------------- passive monitor (third radio) ----
+
+    def _start_passive_monitor(self):
+        """Start passive monitoring on the third radio (all channels, handshake capture)."""
+        if self._passive_running or (self._passive_thread and self._passive_thread.is_alive()):
+            return
+        if not self._passive_iface_cfg:
+            return
+        self._passive_stop.clear()
+        self._passive_running = True
+        self._passive_log = []
+        self._passive_thread = threading.Thread(
+            target=self._passive_monitor_loop, daemon=True
+        )
+        self._passive_thread.start()
+        self._log_passive("passive monitor started on %s" % self._passive_iface_cfg)
+
+    def _stop_passive_monitor(self):
+        """Stop passive monitoring."""
+        if not self._passive_running:
+            return
+        self._passive_stop.set()
+        self._passive_running = False
+        if self._passive_thread:
+            self._passive_thread.join(timeout=5)
+        self._log_passive("passive monitor stopped")
+
+    def _log_passive(self, msg):
+        """Append a message to the passive monitor log."""
+        ts = time.strftime("[%H:%M:%S]")
+        line = "%s %s" % (ts, msg)
+        self._passive_log.append(line)
+        if len(self._passive_log) > 200:
+            self._passive_log = self._passive_log[-200:]
+        logging.info("[wd_scanner] [passive] %s" % msg)
+
+    def _passive_monitor_loop(self):
+        """
+        Continuously run airodump-ng on all channels (channel hopping).
+        Parse captured handshakes and copy them to bettercap's handshake folder.
+        """
+        if not self._passive_mon_iface:
+            self._log_passive("ERROR: no monitor interface available")
+            self._passive_running = False
+            return
+
+        # Get handshake output directory.
+        try:
+            handshake_dir = self._agent.config()["bettercap"]["handshakes"]
+        except Exception:
+            handshake_dir = "/root/handshakes"
+
+        # Create temporary directory for airodump-ng output.
+        temp_dir = tempfile.mkdtemp(prefix="wd_passive_")
+        self._log_passive("temp dir: %s" % temp_dir)
+        self._log_passive("handshake dir: %s" % handshake_dir)
+
+        try:
+            # Start airodump-ng with channel hopping across all channels.
+            # Write captures to temp directory, prefix "passive".
+            cmd = [
+                "airodump-ng",
+                "--channel", "1,2,3,4,5,6,7,8,9,10,11,12,13",  # 2.4GHz channels
+                "-w", os.path.join(temp_dir, "passive"),
+                "--output-format", "pcap",
+                self._passive_mon_iface,
+            ]
+            self._log_passive("cmd: %s" % " ".join(cmd))
+
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            self._log_passive("airodump-ng started (PID %d)" % proc.pid)
+
+            # Monitor loop: check for new handshakes every 10 seconds.
+            last_check = 0
+            while not self._passive_stop.is_set():
+                time.sleep(1)
+
+                # Every 10 seconds, check for handshakes.
+                if time.time() - last_check >= 10:
+                    last_check = time.time()
+                    self._check_passive_handshakes(temp_dir, handshake_dir)
+
+            # Stop airodump-ng.
+            self._log_passive("stopping airodump-ng...")
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+            # Final handshake check.
+            self._check_passive_handshakes(temp_dir, handshake_dir)
+
+        except Exception as e:
+            self._log_passive("ERROR: %s" % str(e))
+        finally:
+            # Clean up temp directory.
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+            self._passive_running = False
+
+    def _check_passive_handshakes(self, temp_dir, handshake_dir):
+        """
+        Check temp_dir for captured handshakes and copy them to handshake_dir.
+        Uses aircrack-ng to verify captures contain handshakes.
+        """
+        try:
+            # Find all pcap files in temp dir.
+            pcap_files = glob.glob(os.path.join(temp_dir, "passive-*.cap"))
+
+            for pcap in pcap_files:
+                # Run aircrack-ng to check if this pcap contains a handshake.
+                result = self._run(
+                    ["aircrack-ng", pcap],
+                    check=False,
+                    timeout=10,
+                )
+
+                if result and "1 handshake" in result.lower():
+                    # Extract BSSID from filename or aircrack output.
+                    # Format: passive-01.cap
+                    # We need to parse the BSSID from aircrack-ng output.
+                    bssid_match = re.search(r"([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2})", result)
+                    if bssid_match:
+                        bssid = bssid_match.group(1).replace(":", "").lower()
+                        # Copy to handshake directory with pwnagotchi naming convention.
+                        dest_name = "%s_%d.pcap" % (bssid, int(time.time()))
+                        dest_path = os.path.join(handshake_dir, dest_name)
+
+                        # Only copy if it doesn't already exist.
+                        if not os.path.exists(dest_path):
+                            shutil.copy2(pcap, dest_path)
+                            self._passive_handshakes += 1
+                            self._log_passive("✓ captured handshake: %s → %s" % (bssid, dest_name))
+                            # Add to new handshakes for toast notification.
+                            self._new_handshakes.append(dest_name)
+
+                    # Delete the temp pcap after processing.
+                    try:
+                        os.remove(pcap)
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            self._log_passive("handshake check error: %s" % str(e))
 
     # ------------------------------------------------------------------ CSV
 
@@ -2738,6 +2979,18 @@ class WdScanner(plugins.Plugin):
             self._release_iface()
             return redirect("/plugins/wd_scanner/")
 
+        if req.method == "POST" and norm == "select_passive":
+            name = (req.form.get("interface") or "").strip()
+            ok, msg = self._select_passive_iface(name)
+            if not ok:
+                self._select_error = msg
+            return redirect("/plugins/wd_scanner/")
+
+        if req.method == "POST" and norm == "release_passive":
+            self._stop_passive_monitor()
+            self._release_passive_iface()
+            return redirect("/plugins/wd_scanner/")
+
         if req.method == "POST" and norm == "scan":
             if not self._iface_cfg:
                 self._select_error = "no aux radio selected"
@@ -2955,6 +3208,11 @@ class WdScanner(plugins.Plugin):
                 "c2_host": self._c2_host,
                 "iface": self._iface_cfg,
                 "mon_iface": self._mon_iface,
+                "passive_iface": self._passive_iface_cfg,
+                "passive_mon_iface": self._passive_mon_iface,
+                "passive_running": self._passive_running,
+                "passive_handshakes": self._passive_handshakes,
+                "passive_log": self._passive_log[-50:],
                 "available": self._list_wireless_ifaces(),
                 "select_error": self._select_error,
                 "pmkid_available": self._pmkid_available,
@@ -3046,6 +3304,38 @@ class WdScanner(plugins.Plugin):
                 n=escape(self._iface_cfg), lbl=escape(label)))
         if not opt_lines:
             opt_lines.append("<option value='' disabled selected>// no wireless devices //</option>")
+
+        # Build passive monitor picker options (exclude main iface and active aux).
+        passive_opt_lines = []
+        passive_seen_current = False
+        for it in available:
+            # Skip interfaces already in use.
+            if it["name"] == main_iface or it["name"] == self._iface_cfg or it["name"] == self._mon_iface:
+                continue
+            is_passive = (it["name"] == self._passive_iface_cfg or
+                          (self._passive_mon_iface and it["name"] == self._passive_mon_iface))
+            sel = " selected" if is_passive else ""
+            if is_passive:
+                passive_seen_current = True
+            label = "%s  [%s]" % (it["name"], it["type"])
+            if it.get("addr"):
+                label += "  %s" % it["addr"]
+            if is_passive and it["name"] != self._passive_iface_cfg:
+                label = "%s  [monitor ← %s]" % (it["name"], self._passive_iface_cfg)
+            passive_opt_lines.append(
+                "<option value='{n}'{sel}>{lbl}</option>".format(
+                    n=escape(it["name"]), sel=sel, lbl=escape(label)
+                )
+            )
+        if self._passive_iface_cfg and not passive_seen_current:
+            if self._passive_mon_iface:
+                label = "%s  [monitor ← %s]" % (self._passive_mon_iface, self._passive_iface_cfg)
+            else:
+                label = "%s  [missing]" % self._passive_iface_cfg
+            passive_opt_lines.insert(0, "<option value='{n}' selected>{lbl}</option>".format(
+                n=escape(self._passive_iface_cfg), lbl=escape(label)))
+        if not passive_opt_lines:
+            passive_opt_lines.append("<option value='' disabled selected>// no available radios //</option>")
 
         select_err_html = ""
         if self._select_error:
@@ -3605,6 +3895,114 @@ body::before {{
   border: 1px dashed var(--cyan-d);
   color: var(--cyan);
   font-size: 12px; letter-spacing: .08em;
+}}
+
+/* ---- passive monitor picker ---- */
+.passive-picker {{
+  margin: 0 -12px 12px;
+  padding: 10px;
+  background: linear-gradient(180deg, #0a1207, #07090b);
+  border-top: 1px solid var(--green);
+  border-bottom: 1px solid var(--green);
+  display: flex; flex-direction: column; gap: 8px;
+}}
+.passive-picker h3 {{
+  margin: 0 0 4px;
+  font-size: 13px; font-weight: 700;
+  color: var(--green); letter-spacing: .2em;
+  text-transform: uppercase;
+}}
+.passive-blurb {{
+  margin: 0 0 8px;
+  font-size: 11px; color: var(--mute);
+  letter-spacing: .06em;
+}}
+.passive-picker form {{ margin: 0; }}
+.passive-picker .picker-select-row {{
+  display: flex;
+}}
+.passive-picker select {{
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+  appearance: none; -webkit-appearance: none;
+  background: #05080a;
+  color: var(--green);
+  border: 1px solid var(--green);
+  height: 44px;
+  padding: 0 32px 0 12px;
+  font: inherit;
+  letter-spacing: .08em;
+  background-image: linear-gradient(45deg, transparent 50%, var(--green) 50%),
+                    linear-gradient(135deg, var(--green) 50%, transparent 50%);
+  background-position: calc(100% - 18px) 50%, calc(100% - 12px) 50%;
+  background-size: 6px 6px, 6px 6px;
+  background-repeat: no-repeat;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+}}
+.passive-picker select:focus {{
+  outline: none; border-color: var(--green);
+  box-shadow: 0 0 0 2px rgba(43,255,136,.2);
+}}
+.passive-picker .picker-actions {{
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}}
+.passive-picker .picker-actions form {{
+  display: flex;
+  margin: 0;
+}}
+.passive-picker .picker-actions .btn {{
+  flex: 1 1 auto;
+  width: 100%;
+  height: 44px;
+  padding: 0 14px;
+  background: #0a1d07;
+  color: var(--green);
+  border-color: var(--green);
+}}
+.passive-picker .picker-actions .btn:hover {{
+  background: #0f2a0a;
+}}
+.passive-picker .picker-actions .btn.alt {{
+  background: #2a1300;
+  color: var(--orange);
+  border-color: var(--orange);
+}}
+.passive-status {{
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  background: #04070a;
+  border: 1px solid var(--grid);
+  font-size: 12px;
+}}
+.passive-state {{
+  padding: 2px 8px;
+  font-weight: 700;
+  letter-spacing: .2em;
+  border: 1px solid;
+}}
+.passive-state.run {{
+  color: var(--green);
+  background: rgba(43,255,136,.1);
+  border-color: var(--green);
+}}
+.passive-state.idle {{
+  color: var(--mute);
+  background: transparent;
+  border-color: var(--grid);
+}}
+.passive-hs {{
+  color: var(--cyan);
+  letter-spacing: .08em;
+}}
+.passive-hs b {{
+  color: var(--green);
+  font-size: 14px;
 }}
 
 /* ---- node grid ---- */
@@ -4335,6 +4733,30 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
   {select_err}
   {select_hint}
   {shared_warn}
+
+  <div class='passive-picker'>
+    <h3>passive monitor (3rd radio)</h3>
+    <p class='passive-blurb'>continuous all-channel capture → handshakes auto-fed to pwnagotchi</p>
+    <form method='POST' action='/plugins/wd_scanner/select_passive' id='passive-picker-form'>
+      {csrf}
+      <div class='picker-select-row'>
+        <select name='interface' aria-label='passive monitor radio'>
+          {passive_options}
+        </select>
+      </div>
+    </form>
+    <div class='picker-actions'>
+      <button type='submit' form='passive-picker-form' class='btn'>&#9711; SELECT PASSIVE</button>
+      <form method='POST' action='/plugins/wd_scanner/release_passive'>
+        {csrf}
+        <button type='submit' class='btn alt'>&#10005; RELEASE</button>
+      </form>
+    </div>
+    <div class='passive-status' id='passive-status'>
+      <span class='passive-state {passive_state_cls}'>{passive_state_text}</span>
+      <span class='passive-hs'>handshakes: <b>{passive_hs}</b></span>
+    </div>
+  </div>
   {restart_banner}
 
   <div class='toolbar'>
@@ -4940,6 +5362,11 @@ option[data-role='shared'] {{ color: var(--warn) !important; }}
             release_disabled="disabled" if (
                 not has_iface or self._scan_running or self._action_running
             ) else "",
+            passive_options="\n".join(passive_opt_lines),
+            passive_state_cls="run" if self._passive_running else "idle",
+            passive_state_text=("RUNNING" if self._passive_running
+                               else ("IDLE" if self._passive_iface_cfg else "—")),
+            passive_hs=self._passive_handshakes,
             select_err=select_err_html,
             select_hint=(
                 "" if has_iface

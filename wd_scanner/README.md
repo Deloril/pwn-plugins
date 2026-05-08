@@ -48,16 +48,20 @@ the picker shows `wlan1mon [monitor <- wlan1]` so you know it's active.
 
 ### 2. Scan + background monitoring
 
-Tap **SCAN** for an explicit sweep. On a dedicated radio the plugin runs
-`airodump-ng` and aggregates SSIDs / BSSIDs / channels / RSSI / client
-counts. On a shared radio it polls bettercap's session for the same data.
+**Configurable scan duration**: enter a value (5–300 seconds) in the
+input next to the SCAN button to control how long the scan runs before
+results are returned. On a dedicated radio the plugin runs `airodump-ng`
+and aggregates SSIDs / BSSIDs / channels / RSSI / client counts /
+**security type**. On a shared radio it polls bettercap's session for
+the same data.
 
 **Background monitoring**: when a radio is selected and idle (no scan or
 attack running), the plugin automatically polls bettercap's session every
 ~10 seconds and keeps the network list up to date. No need to repeatedly
 tap SCAN — the view refreshes itself.
 
-Results are listed strongest-first with signal pips, channel, RSSI, a
+Results are listed strongest-first with signal pips, channel, RSSI,
+**encryption type** (WPA3, WPA2, WPA, WEP, or OPN — colour-coded), a
 heat-coded client count, and — if pwnagotchi has already cracked the
 network — the recovered password inline (with a COPY button).
 
@@ -67,9 +71,14 @@ under a single header showing the SSID, AP count, and total client
 count. Each BSSID gets its own compact sub-card with individual attack
 buttons.
 
-The network list is **collapsible** — tap the "nodes detected" heading
-to collapse/expand it for easier navigation on small screens. State
-persists in localStorage.
+**Per-SSID collapse**: tap any network's header to collapse/expand that
+individual SSID's details (metadata, buttons). State persists in
+localStorage per SSID, so collapsed networks stay collapsed across
+refreshes.
+
+The full network list is also **collapsible** — tap the "nodes detected"
+heading to collapse/expand the entire list. State persists in
+localStorage.
 
 ### 3. Single-target attack
 
@@ -127,7 +136,14 @@ it kicks a worker that:
 The total wall-clock time is bounded by `recon_seconds` (default 60 s).
 Disconnect happens as soon as the scan finishes, regardless of success.
 
-The reports are listed in a sub-page at `/plugins/wd_scanner/recon`
+**Live progress on the main page**: every step of the recon process is
+logged verbosely to the main scanner page's action log (interface mode
+switch, wpa_supplicant launch, DHCP negotiation, subnet derivation, nmap
+sweep with per-host results, port scan findings, reverse DNS, and
+teardown). The activity feed auto-refreshes every 5 seconds so you can
+watch exactly what's happening without navigating away.
+
+The reports are also listed in a sub-page at `/plugins/wd_scanner/recon`
 (linked from the **RECON** nav button on the main screen, with a count
 badge); each report opens to a detail view showing BSSID / our IP /
 gateway / subnet / duration, then per-host ports + reverse-DNS names,

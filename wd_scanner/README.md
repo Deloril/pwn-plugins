@@ -178,7 +178,59 @@ from the **PLUNDER** nav button). Each job detail page shows:
 
 The total wall-clock time is bounded by `plunder_seconds` (default 300 s).
 
-### 7. Auto-update
+### 7. PMKID Attack Mode
+
+Alternative attack method using `hcxdumptool` for capturing PMKID hashes
+without deauth. Essential for WPA3 and PMF-protected networks where
+traditional deauth attacks fail. Captures are converted to hashcat format
+(`.hc22000`) for offline cracking.
+
+Enable PMKID mode via config or UI toggle. Requires `hcxdumptool` and
+`hcxpcapngtool` installed.
+
+### 8. Auto-Attack Mode
+
+Automatically attack all visible networks during a scan. Targets are
+queued and attacked sequentially with configurable filters:
+- Minimum signal strength
+- Minimum client count  
+- Security type (WPA2, WPA3, etc.)
+- Hide already-pwned networks
+
+Enable via `main.plugins.wd_scanner.auto_attack = true` in config.toml.
+
+### 9. Network Notes
+
+Add custom notes per BSSID (e.g., "coffee shop", "avoid - honeypot").
+Notes persist across sessions in `wd_recon_notes.json` and display on
+network cards.
+
+### 10. Target Filtering
+
+Filter visible networks by signal strength, client count, security type,
+or pwned status. Reduces clutter and focuses on high-value targets.
+
+### 11. Data Export
+
+Export all captured data for a specific BSSID (handshakes, recon reports,
+plunder data) as a single `.tar.gz` archive for offline analysis or
+evidence preservation.
+
+### 12. MAC Randomization
+
+Randomize interface MAC address for operational security. Choose fully
+random or preset vendor OUIs (Apple, Samsung, Intel, etc.) to blend in
+with legitimate devices.
+
+Enable via config: `main.plugins.wd_scanner.mac_random_enabled = true`
+
+### 13. Live Terminal Popup
+
+Real-time terminal-style output for recon/plunder operations with Watch
+Dogs theme. Auto-appears on operation start, live-updates every second,
+color-coded logs (errors/warnings/info), auto-scroll.
+
+### 14. Auto-update
 
 `on_internet_available` checks GitHub for a newer copy of the plugin
 (default once a day). New bytes are validated (parse, identity guard,
@@ -233,6 +285,13 @@ main.plugins.wd_scanner.recon_subnet_max = 256       # cap alive-host count
 # Plunder
 main.plugins.wd_scanner.plunder_seconds = 300        # total time budget for data download
 
+# Auto-attack
+main.plugins.wd_scanner.auto_attack = false          # automatically attack all visible networks
+
+# MAC randomization
+main.plugins.wd_scanner.mac_random_enabled = false   # randomize interface MAC
+main.plugins.wd_scanner.mac_random_oui = "Apple"     # or "Samsung", "Intel", etc. (optional)
+
 # Auto-update
 main.plugins.wd_scanner.update_url = "https://raw.githubusercontent.com/Deloril/pwn-plugins/main/wd_scanner/wd_scanner.py"
 main.plugins.wd_scanner.update_check_interval = 86400  # 24h
@@ -281,6 +340,17 @@ sudo apt-get install -y wpasupplicant isc-dhcp-client nmap
 | `isc-dhcp-client` | `dhclient` | Obtaining an IPv4 address from the AP's DHCP server |
 | `nmap` | `nmap` | Ping sweep (`-sn`) and port scan (`-F --open`) during recon |
 
+### Required for PMKID attacks
+
+```bash
+sudo apt-get install -y hcxdumptool hcxtools
+```
+
+| Package | Provides | Used for |
+|---|---|---|
+| `hcxdumptool` | `hcxdumptool` | Capturing PMKID hashes from target APs |
+| `hcxtools` | `hcxpcapngtool` | Converting captures to hashcat format (.hc22000) |
+
 ### Required for plunder
 
 ```bash
@@ -295,7 +365,7 @@ sudo apt-get install -y smbclient wget
 ### Install everything at once
 
 ```bash
-sudo apt-get install -y wpasupplicant isc-dhcp-client nmap smbclient wget
+sudo apt-get install -y wpasupplicant isc-dhcp-client nmap smbclient wget hcxdumptool hcxtools
 ```
 
 If any dependency is missing the plugin logs a clear message and skips

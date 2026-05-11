@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.8.7"
+    __version__ = "2.8.8"
     __license__ = "GPL3"
     __description__ = (
         "Three-radio setup: passive monitor (radio 3) maintains network list, "
@@ -1883,6 +1883,10 @@ class WdScanner(plugins.Plugin):
             result["ip"], result["gateway"] = ip, gw
             self._log_recon("  CONNECTED! our IP: %s | gateway: %s" % (ip, gw or "unknown"))
 
+            # IPs to exclude from scanning/plundering (ourselves).
+            self_ips = {ip}
+            self._log_recon("  excluding our own IP %s from scan targets" % ip)
+
             # 4. Compute subnet, capped to /24.
             self._log_recon("step 5/7: deriving network subnet...")
             net_base, net_mask = self._derive_subnet(ip)
@@ -1912,9 +1916,11 @@ class WdScanner(plugins.Plugin):
             # Always include the gateway if we know it.
             if gw and gw not in alive:
                 alive.insert(0, gw)
+            # Never scan ourselves.
+            alive = [h for h in alive if h not in self_ips]
             alive = alive[: self._recon_subnet_max]
             result["alive_hosts"] = alive
-            self._log_recon("  ping sweep complete: %d hosts responded" % len(alive))
+            self._log_recon("  ping sweep complete: %d hosts responded (excluding self)" % len(alive))
             if alive:
                 self._log_recon("  alive: %s" % ", ".join(alive[:15]))
                 if len(alive) > 15:
@@ -2090,6 +2096,11 @@ class WdScanner(plugins.Plugin):
             self._log_plunder("using scan interface %s (will temporarily take over)" % iface)
 
         self._log_plunder("plunder target network: %s (%s)" % (ssid, bssid))
+
+        # Filter out our own IP so we never plunder ourselves.
+        # We don't have our IP yet (DHCP hasn't run), so also filter
+        # after DHCP below. Pre-filter using any cached IP from the
+        # recon report that triggered this plunder.
         self._log_plunder("hosts to plunder: %d" % len(targets))
 
         if not shutil.which("wpa_supplicant") or not shutil.which("dhclient"):
@@ -2185,6 +2196,10 @@ class WdScanner(plugins.Plugin):
                 self._log_plunder("no IPv4 acquired; aborting plunder")
                 return
             self._log_plunder("connected: ip=%s" % ip)
+
+            # Never plunder ourselves.
+            targets = [t for t in targets if t.get("ip") != ip]
+            self._log_plunder("targets after excluding self (%s): %d" % (ip, len(targets)))
 
             # Plunder each host.
             deadline = t0 + self._plunder_seconds

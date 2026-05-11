@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.8.1"
+    __version__ = "2.8.2"
     __license__ = "GPL3"
     __description__ = (
         "Three-radio setup: passive monitor (radio 3) maintains network list, "
@@ -1646,8 +1646,10 @@ class WdScanner(plugins.Plugin):
                 return iface_name, False, False
 
         # If we have a scanning interface, use it (temporarily take it over).
+        # Use the actual monitor vif if airmon-ng renamed it (e.g. wlan1mon).
         if self._iface_cfg:
-            return self._iface_cfg, self._shared_radio, True
+            actual = self._mon_iface if self._mon_iface else self._iface_cfg
+            return actual, self._shared_radio, True
 
         # Fall back to the parent of pwnagotchi's monitor vif.
         # main_iface is usually `mon0`; we want the parent (`wlan0`).

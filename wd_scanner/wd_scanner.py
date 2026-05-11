@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.8.5"
+    __version__ = "2.8.6"
     __license__ = "GPL3"
     __description__ = (
         "Three-radio setup: passive monitor (radio 3) maintains network list, "
@@ -1861,13 +1861,13 @@ class WdScanner(plugins.Plugin):
 
             # 3. dhclient.
             self._log_recon("step 4/7: requesting DHCP lease on %s (timeout %ds)..." % (iface, self._recon_dwell))
-            self._log_recon("  cmd: dhclient -1 --timeout %d %s" % (self._recon_dwell, iface))
+            self._log_recon("  cmd: dhclient -1 -timeout %d %s" % (self._recon_dwell, iface))
             dhcp_result = self._run([
                 "dhclient",
                 "-pf", dhcp_pid,
                 "-lf", dhcp_lease,
                 "-1",
-                "--timeout", str(self._recon_dwell),
+                "-timeout", str(self._recon_dwell),
                 iface,
             ], check=False, timeout=self._recon_dwell + 5)
             if dhcp_result:

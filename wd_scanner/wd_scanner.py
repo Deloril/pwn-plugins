@@ -1614,7 +1614,8 @@ class WdScanner(plugins.Plugin):
         """
         Decide which physical interface we'll use for recon. We need a
         managed-mode capable iface. Strategy:
-          - Prefer a dedicated radio (not the one bettercap is on and not scanning).
+          - Prefer a dedicated radio (not the one bettercap is on, not
+            scanning, and not running passive monitor).
           - If only scanning radio available, use it (we'll handle the transition).
           - Otherwise fall back to whatever phy backs pwnagotchi's main
             radio: take down the monitor vif, bring the parent up in
@@ -1625,17 +1626,21 @@ class WdScanner(plugins.Plugin):
         main_iface = pwnagotchi_config_main_iface()
         main_phy = self._iface_phy(main_iface) if main_iface else None
 
-        # Build list of interfaces currently in use for scanning.
-        scan_ifaces = set()
+        # Build set of interfaces currently in use (scanning + passive monitor).
+        busy_ifaces = set()
         if self._mon_iface:
-            scan_ifaces.add(self._mon_iface)
+            busy_ifaces.add(self._mon_iface)
         if self._iface_cfg:
-            scan_ifaces.add(self._iface_cfg)
+            busy_ifaces.add(self._iface_cfg)
+        if self._passive_iface_cfg:
+            busy_ifaces.add(self._passive_iface_cfg)
+        if self._passive_mon_iface:
+            busy_ifaces.add(self._passive_mon_iface)
 
-        # Look for a dedicated radio first (not used for scanning).
+        # Look for a dedicated radio first (not used for scanning or passive).
         for it in self._list_wireless_ifaces():
             iface_name = it.get("name")
-            if iface_name in scan_ifaces:
+            if iface_name in busy_ifaces:
                 continue
             if not it.get("shared") and iface_name != main_iface:
                 return iface_name, False, False
@@ -1973,14 +1978,29 @@ class WdScanner(plugins.Plugin):
                 )
                 self._log_recon("  wpa_supplicant terminated")
 
-            # Restore the iface to monitor mode if it was bettercap's.
-            if was_shared:
+            # Restore the iface to monitor mode if it was shared or was our scan iface.
+            if was_shared or is_scan_iface:
                 self._log_recon("  restoring %s to monitor mode..." % iface)
                 self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
                 self._run(["iw", "dev", iface, "set", "type", "monitor"],
                           check=False, timeout=5)
                 self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
                 self._log_recon("  %s restored to monitor mode" % iface)
+                # If this was the scan/aux iface, re-run airmon-ng to get the
+                # monitor vif back so the aux picker still works.
+                if is_scan_iface and self._iface_cfg:
+                    self._log_recon("  re-enabling monitor mode via airmon-ng...")
+                    result_am = self._run(
+                        ["airmon-ng", "start", iface], check=False, timeout=15
+                    )
+                    if result_am:
+                        m = re.search(
+                            r"monitor mode (?:vif )?enabled (?:for|on) (\w+)",
+                            result_am, re.I,
+                        )
+                        if m:
+                            self._mon_iface = m.group(1)
+                            self._log_recon("  aux monitor restored: %s" % self._mon_iface)
 
             if bettercap_paused_here:
                 self._log_recon("  resuming bettercap wifi.recon...")
@@ -2216,10 +2236,22 @@ class WdScanner(plugins.Plugin):
                     ["pkill", "-f", r"wpa_supplicant.*-i\s*%s(\s|$)" % re.escape(iface)],
                     check=False, timeout=5,
                 )
-            if was_shared:
+            if was_shared or is_scan_iface:
                 self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
                 self._run(["iw", "dev", iface, "set", "type", "monitor"], check=False, timeout=5)
                 self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
+                if is_scan_iface and self._iface_cfg:
+                    result_am = self._run(
+                        ["airmon-ng", "start", iface], check=False, timeout=15
+                    )
+                    if result_am:
+                        m = re.search(
+                            r"monitor mode (?:vif )?enabled (?:for|on) (\w+)",
+                            result_am, re.I,
+                        )
+                        if m:
+                            self._mon_iface = m.group(1)
+                            self._log_plunder("aux monitor restored: %s" % self._mon_iface)
             if bettercap_paused_here:
                 try:
                     agent.run("wifi.recon on")

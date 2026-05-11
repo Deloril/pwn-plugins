@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.8.3"
+    __version__ = "2.8.4"
     __license__ = "GPL3"
     __description__ = (
         "Three-radio setup: passive monitor (radio 3) maintains network list, "
@@ -1601,8 +1601,6 @@ class WdScanner(plugins.Plugin):
                 self._recon_running = False
             if self._action_running or self._recon_running:
                 return False, "an attack/recon is already running"
-            if self._agent is None:
-                return False, "agent not ready yet"
             if not password or password == "<recovered>":
                 return False, "no password on file for this network"
             self._recon_running = True
@@ -2071,8 +2069,6 @@ class WdScanner(plugins.Plugin):
         with self._lock:
             if self._action_running or self._recon_running or self._plunder_running:
                 return False, "another operation is already running"
-            if self._agent is None:
-                return False, "agent not ready"
             self._plunder_running = True
             self._plunder_log = []
             self._plunder_thread = threading.Thread(

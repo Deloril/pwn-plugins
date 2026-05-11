@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.8.2"
+    __version__ = "2.8.3"
     __license__ = "GPL3"
     __description__ = (
         "Three-radio setup: passive monitor (radio 3) maintains network list, "
@@ -1594,6 +1594,11 @@ class WdScanner(plugins.Plugin):
     def _start_recon(self, ssid, bssid, password):
         """Connect to a known-pwned network and run a recon sweep."""
         with self._lock:
+            # Safety: if _recon_running is stuck from a crashed thread,
+            # check whether the thread is actually still alive.
+            if self._recon_running and self._recon_thread and not self._recon_thread.is_alive():
+                logging.warning("[wd_scanner] _recon_running was stuck True; resetting")
+                self._recon_running = False
             if self._action_running or self._recon_running:
                 return False, "an attack/recon is already running"
             if self._agent is None:
@@ -1678,6 +1683,19 @@ class WdScanner(plugins.Plugin):
 
     def _recon_worker(self, ssid, bssid, password):
         """Body of the recon job. Runs in its own thread."""
+        try:
+            self._recon_worker_inner(ssid, bssid, password)
+        except Exception as e:
+            logging.exception("[wd_scanner] recon worker crashed")
+            try:
+                self._log_recon("FATAL: recon worker crashed: %s" % e)
+            except Exception:
+                pass
+        finally:
+            self._recon_running = False
+
+    def _recon_worker_inner(self, ssid, bssid, password):
+        """Actual recon logic, called from _recon_worker."""
         agent = self._agent
         self._log_recon(">>> RECON STARTED — target SSID=%s BSSID=%s" % (ssid, bssid))
         self._log_debug("recon_worker started: ssid=%s, bssid=%s" % (ssid, bssid))
@@ -3122,7 +3140,9 @@ class WdScanner(plugins.Plugin):
             if not password:
                 self._select_error = "no password on file for %s" % (ssid or bssid)
                 return redirect("/plugins/wd_scanner/")
-            self._start_recon(ssid, bssid, password)
+            ok, msg = self._start_recon(ssid, bssid, password)
+            if not ok:
+                self._select_error = msg
             return redirect("/plugins/wd_scanner/")
 
         if req.method == "POST" and norm == "recon/delete":

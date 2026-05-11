@@ -1568,8 +1568,10 @@ class WdScanner(plugins.Plugin):
 
         # Hide pwned networks filter.
         if self._filter_hide_pwned:
-            bssid = ap.get("bssid", "")
-            if self._get_password(bssid):
+            bssid = ap.get("bssid", "").lower()
+            cracked = self._load_cracked_index()
+            ssid = ap.get("ssid", "")
+            if cracked.get(bssid) or cracked.get("ssid::" + ssid.lower()):
                 return False
 
         return True
@@ -3093,7 +3095,7 @@ class WdScanner(plugins.Plugin):
             # Delete a recon report.
             report_name = (req.form.get("report") or "").strip()
             if report_name and report_name.endswith(".json"):
-                report_path = os.path.join(self._recon_dir(), report_name)
+                report_path = os.path.join(self._handshake_dir(), report_name)
                 try:
                     if os.path.exists(report_path):
                         os.remove(report_path)

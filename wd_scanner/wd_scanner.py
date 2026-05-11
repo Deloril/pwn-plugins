@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.8.6"
+    __version__ = "2.8.7"
     __license__ = "GPL3"
     __description__ = (
         "Three-radio setup: passive monitor (radio 3) maintains network list, "
@@ -1859,15 +1859,16 @@ class WdScanner(plugins.Plugin):
             time.sleep(2)
             self._log_recon("  waiting for WPA association to complete...")
 
-            # 3. dhclient.
+            # 3. dhclient.  Use -1 (try once) and let the subprocess
+            #    timeout handle the dwell — ISC dhclient 4.4 doesn't
+            #    accept -timeout / --timeout in many builds.
             self._log_recon("step 4/7: requesting DHCP lease on %s (timeout %ds)..." % (iface, self._recon_dwell))
-            self._log_recon("  cmd: dhclient -1 -timeout %d %s" % (self._recon_dwell, iface))
+            self._log_recon("  cmd: dhclient -1 %s" % iface)
             dhcp_result = self._run([
                 "dhclient",
                 "-pf", dhcp_pid,
                 "-lf", dhcp_lease,
                 "-1",
-                "-timeout", str(self._recon_dwell),
                 iface,
             ], check=False, timeout=self._recon_dwell + 5)
             if dhcp_result:
@@ -2176,7 +2177,7 @@ class WdScanner(plugins.Plugin):
             self._log_plunder("requesting DHCP lease...")
             self._run([
                 "dhclient", "-pf", dhcp_pid, "-lf", dhcp_lease,
-                "-1", "-timeout", str(self._recon_dwell), iface,
+                "-1", iface,
             ], check=False, timeout=self._recon_dwell + 5)
 
             ip = self._iface_ipv4(iface)

@@ -71,7 +71,7 @@ _DEFAULT_UPDATE_URL = (
 
 class WdScanner(plugins.Plugin):
     __author__ = "you@example.com"
-    __version__ = "2.8.8"
+    __version__ = "2.9.0"
     __license__ = "GPL3"
     __description__ = (
         "Three-radio setup: passive monitor (radio 3) maintains network list, "
@@ -1784,6 +1784,7 @@ class WdScanner(plugins.Plugin):
             "subnet": None,
             "alive_hosts": [],
             "ports": {},        # ip -> [open ports]
+            "os": {},            # ip -> OS guess string
             "names": {},         # ip -> reverse DNS
             "log": [],
             "duration_seconds": 0,
@@ -1934,12 +1935,13 @@ class WdScanner(plugins.Plugin):
             if alive:
                 port_seconds = int(remaining)
                 per_host_timeout = max(5, port_seconds // max(1, len(alive)))
-                self._log_recon("  cmd: nmap -Pn -n -F --open -T4 (top-100 ports)")
+                self._log_recon("  cmd: nmap -Pn -n -F -O --osscan-guess --open -T4 (top-100 ports + OS detection)")
                 self._log_recon("  scanning %d hosts, %ds per-host timeout, %ds total budget" % (
                     len(alive), per_host_timeout, port_seconds
                 ))
                 ports_out = self._run([
                     "nmap", "-Pn", "-n", "-F",
+                    "-O", "--osscan-guess",
                     "--max-retries", "1",
                     "--host-timeout", str(per_host_timeout) + "s",
                     "-T4",
@@ -1947,12 +1949,19 @@ class WdScanner(plugins.Plugin):
                 ] + alive,
                     check=False, timeout=port_seconds + 15) or ""
                 result["ports"] = self._parse_nmap_ports(ports_out)
+                result["os"] = self._parse_nmap_os(ports_out)
                 # Log per-host port findings.
                 if result["ports"]:
                     for h, ports in result["ports"].items():
                         self._log_recon("  %s → open ports: %s" % (h, ", ".join(str(p) for p in ports)))
                 else:
                     self._log_recon("  no open ports found on any host")
+                # Log OS detection results.
+                if result["os"]:
+                    for h, os_guess in result["os"].items():
+                        self._log_recon("  %s → OS: %s" % (h, os_guess))
+                else:
+                    self._log_recon("  no OS fingerprints detected")
             else:
                 self._log_recon("  no alive hosts to port-scan — skipping")
 
@@ -1972,9 +1981,9 @@ class WdScanner(plugins.Plugin):
                 self._log_recon("  no reverse DNS names resolved")
 
             self._log_recon(
-                ">>> RECON COMPLETE: %d alive, %d with open ports, %d named (%.1fs)"
-                % (len(alive), len(result["ports"]), len(result["names"]),
-                   time.time() - t0)
+                ">>> RECON COMPLETE: %d alive, %d with open ports, %d OS fingerprinted, %d named (%.1fs)"
+                % (len(alive), len(result["ports"]), len(result.get("os") or {}),
+                   len(result["names"]), time.time() - t0)
             )
         except Exception as e:
             logging.exception("[wd_scanner] recon failed")
@@ -2549,6 +2558,55 @@ class WdScanner(plugins.Plugin):
                     })
         # drop hosts with no open ports
         return {h: ps for h, ps in result.items() if ps}
+
+    @staticmethod
+    def _parse_nmap_os(out):
+        """Map host -> best OS guess string.  Best-effort plain-text parse.
+
+        nmap -O output looks like:
+            Nmap scan report for 192.168.1.1
+            ...
+            Aggressive OS guesses: Linux 4.15 - 5.6 (95%), Linux 5.0 - 5.4 (94%)
+            ...
+        or:
+            OS details: Linux 5.4
+        or:
+            Running: Linux 2.6.X
+        We grab 'OS details' first (most specific), then 'Aggressive OS guesses'
+        (first entry only), then 'Running:' as fallback.
+        """
+        result = {}
+        host = None
+        pat_host = re.compile(r"Nmap scan report for (?:.+?\()?(\d+\.\d+\.\d+\.\d+)\)?")
+        # Track candidates per host — we'll pick the best at the end.
+        candidates = {}  # host -> {"details": str, "guess": str, "running": str}
+        for line in (out or "").splitlines():
+            m_h = pat_host.match(line)
+            if m_h:
+                host = m_h.group(1)
+                candidates.setdefault(host, {})
+                continue
+            if not host:
+                continue
+            stripped = line.strip()
+            # "OS details: Linux 5.4" — most precise single answer
+            if stripped.startswith("OS details:"):
+                candidates[host]["details"] = stripped[len("OS details:"):].strip()
+            # "Aggressive OS guesses: Linux 4.15 - 5.6 (95%), ..."
+            elif stripped.startswith("Aggressive OS guesses:"):
+                raw = stripped[len("Aggressive OS guesses:"):].strip()
+                # Take the top guess (first comma-separated entry)
+                first = raw.split(",")[0].strip()
+                candidates[host]["guess"] = first
+            # "Running: Linux 2.6.X"
+            elif stripped.startswith("Running:"):
+                candidates[host]["running"] = stripped[len("Running:"):].strip()
+        # Pick best per host: details > guess > running
+        for h, c in candidates.items():
+            pick = c.get("details") or c.get("guess") or c.get("running")
+            if pick:
+                result[h] = pick
+        return result
 
     def _list_recon_reports(self):
         """Return reports sorted newest-first."""
@@ -6006,6 +6064,7 @@ footer.tag {{ margin: 16px 0 8px; text-align: center; color: var(--mute);
         alive_hosts = rep.get("alive_hosts") or []
         ports_map = rep.get("ports") or {}
         names_map = rep.get("names") or {}
+        os_map = rep.get("os") or {}
 
         host_rows = []
         for h in alive_hosts:
@@ -6018,16 +6077,24 @@ footer.tag {{ margin: 16px 0 8px; text-align: center; color: var(--mute);
                     ) for p in ports
                 )
             )
+            os_html = ""
+            os_guess = os_map.get(h)
+            if os_guess:
+                os_html = "<div class='host-os'><span class='os-label'>OS</span> {os}</div>".format(
+                    os=escape(os_guess),
+                )
             host_rows.append(
                 "<article class='host-row'>"
                 "  <header class='host-h'>"
                 "    <code class='host-ip'>{ip}</code>"
                 "    <span class='host-name'>{nm}</span>"
                 "  </header>"
+                "  {os}"
                 "  <div class='host-ports'>{ports}</div>"
                 "</article>".format(
                     ip=escape(h),
                     nm=escape(names_map.get(h) or ""),
+                    os=os_html,
                     ports=ports_html,
                 )
             )
@@ -6448,6 +6515,8 @@ body::before {{
 .host-h {{ display: flex; gap: 10px; align-items: baseline; margin-bottom: 4px; flex-wrap: wrap; }}
 .host-ip {{ color: var(--cyan); font-size: 14px; font-weight: 700; }}
 .host-name {{ color: var(--mute); font-size: 12px; word-break: break-all; }}
+.host-os {{ font-size: 11px; color: var(--green); margin-bottom: 4px; letter-spacing: .04em; }}
+.os-label {{ background: #0a2f12; color: var(--green); border: 1px solid #1a5c2a; padding: 1px 5px; font-size: 10px; font-weight: 700; letter-spacing: .08em; margin-right: 6px; }}
 .host-ports {{ display: flex; flex-wrap: wrap; gap: 4px; }}
 .port {{
   background: #06292e; color: var(--cyan); border: 1px solid var(--cyan-d);
